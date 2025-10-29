@@ -2,99 +2,408 @@ package com.samples.flironecamera;
 
 import android.content.Context;
 import android.graphics.Canvas;
+import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.View;
 
+/**
+ * Enhanced SelectionOverlay with:
+ * - Single touch: Move and resize rectangle
+ * - Two-finger pinch: Scale rectangle size
+ * - Visual feedback for better UX
+ * - Temperature display integration
+ */
 public class SelectionOverlay extends View {
-    private final Paint border = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint shade  = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final float EDGE = 24f;
-    private RectF bounds = new RectF(100,100,300,250);
-    private enum Mode { NONE, MOVE, RESIZE_L, RESIZE_T, RESIZE_R, RESIZE_B, RESIZE_LT, RESIZE_RT, RESIZE_LB, RESIZE_RB }
-    private Mode mode = Mode.NONE;
+
+    // Paint objects
+    private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint shadePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint handlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint crosshairPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+    // Constants
+    private static final float EDGE_TOUCH_THRESHOLD = 48f; // Larger touch target
+    private static final float HANDLE_RADIUS = 12f;
+    private static final float MIN_SIZE = 50f;
+    private static final float BORDER_WIDTH = 3f;
+    private static final float TEXT_SIZE = 14f;
+
+    // Selection bounds
+    private RectF bounds = new RectF(100, 100, 300, 250);
+
+    // Interaction state
+    private enum Mode {
+        NONE, MOVE,
+        RESIZE_L, RESIZE_T, RESIZE_R, RESIZE_B,
+        RESIZE_LT, RESIZE_RT, RESIZE_LB, RESIZE_RB,
+        PINCH_ZOOM
+    }
+    private Mode currentMode = Mode.NONE;
     private float lastX, lastY;
 
-    public interface OnBoundsChangedListener { void onChanged(RectF b); }
+    // Multi-touch support
+    private ScaleGestureDetector scaleDetector;
+    private float initialBoundsWidth, initialBoundsHeight;
+    private float boundsCenterX, boundsCenterY;
+
+    // Visual feedback
+    private boolean showHandles = true;
+    private boolean showCrosshair = false;
+
+    // Callback
+    public interface OnBoundsChangedListener {
+        void onChanged(RectF bounds);
+    }
     private OnBoundsChangedListener listener;
-    public void setOnBoundsChangedListener(OnBoundsChangedListener l) { this.listener = l; }
-    public RectF getBounds() { return new RectF(bounds); }
-    public void setBounds(RectF b) { bounds.set(b); invalidate(); if (listener!=null) listener.onChanged(getBounds()); }
 
-    public SelectionOverlay(Context c) {
-        super(c);
-        border.setStyle(Paint.Style.STROKE); border.setStrokeWidth(4f);
-        border.setColor(0xFFFFFFFF);
-        shade.setColor(0x33FFFFFF); shade.setStyle(Paint.Style.FILL);
+    public SelectionOverlay(Context context) {
+        super(context);
+        initPaints();
+        initScaleDetector(context);
     }
 
-    @Override protected void onDraw(Canvas c) {
-        super.onDraw(c);
-        c.drawRect(bounds, shade);
-        c.drawRect(bounds, border);
+    private void initPaints() {
+        // Border paint (solid white)
+        borderPaint.setStyle(Paint.Style.STROKE);
+        borderPaint.setStrokeWidth(BORDER_WIDTH);
+        borderPaint.setColor(0xFFFFFFFF);
+
+        // Shade paint (semi-transparent white)
+        shadePaint.setColor(0x33FFFFFF);
+        shadePaint.setStyle(Paint.Style.FILL);
+
+        // Handle paint (solid white circles)
+        handlePaint.setStyle(Paint.Style.FILL);
+        handlePaint.setColor(0xFFFFFFFF);
+        handlePaint.setShadowLayer(4f, 0f, 2f, 0x80000000);
+
+        // Text paint (white with shadow)
+        textPaint.setColor(0xFFFFFFFF);
+        textPaint.setTextSize(TEXT_SIZE * getResources().getDisplayMetrics().density);
+        textPaint.setTextAlign(Paint.Align.CENTER);
+        textPaint.setShadowLayer(3f, 0f, 1f, 0xFF000000);
+
+        // Crosshair paint (dashed lines)
+        crosshairPaint.setStyle(Paint.Style.STROKE);
+        crosshairPaint.setStrokeWidth(1.5f);
+        crosshairPaint.setColor(0xAAFFFFFF);
+        crosshairPaint.setPathEffect(new DashPathEffect(new float[]{10f, 10f}, 0));
     }
 
-    @Override public boolean onTouchEvent(MotionEvent e) {
-        float x = e.getX(), y = e.getY();
-        switch (e.getActionMasked()) {
-            case MotionEvent.ACTION_DOWN:
-                mode = hitTest(x, y);
-                lastX = x; lastY = y;
+    private void initScaleDetector(Context context) {
+        scaleDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override
+            public boolean onScaleBegin(ScaleGestureDetector detector) {
+                currentMode = Mode.PINCH_ZOOM;
+                initialBoundsWidth = bounds.width();
+                initialBoundsHeight = bounds.height();
+                boundsCenterX = bounds.centerX();
+                boundsCenterY = bounds.centerY();
+                showHandles = false;
+                showCrosshair = true;
                 return true;
-            case MotionEvent.ACTION_MOVE:
-                float dx = x - lastX, dy = y - lastY;
-                applyDrag(dx, dy);
-                lastX = x; lastY = y;
-                if (listener != null) listener.onChanged(getBounds());
+            }
+
+            @Override
+            public boolean onScale(ScaleGestureDetector detector) {
+                float scaleFactor = detector.getScaleFactor();
+
+                // Calculate new size
+                float newWidth = initialBoundsWidth * scaleFactor;
+                float newHeight = initialBoundsHeight * scaleFactor;
+
+                // Apply minimum size constraint
+                newWidth = Math.max(newWidth, MIN_SIZE);
+                newHeight = Math.max(newHeight, MIN_SIZE);
+
+                // Apply maximum size constraint (80% of view)
+                float maxWidth = getWidth() * 0.8f;
+                float maxHeight = getHeight() * 0.8f;
+                newWidth = Math.min(newWidth, maxWidth);
+                newHeight = Math.min(newHeight, maxHeight);
+
+                // Update bounds centered on original center
+                bounds.set(
+                        boundsCenterX - newWidth / 2f,
+                        boundsCenterY - newHeight / 2f,
+                        boundsCenterX + newWidth / 2f,
+                        boundsCenterY + newHeight / 2f
+                );
+
+                // Keep within view bounds
+                constrainToView();
+
+                invalidate();
+                notifyListener();
+                return true;
+            }
+
+            @Override
+            public void onScaleEnd(ScaleGestureDetector detector) {
+                showHandles = true;
+                showCrosshair = false;
+                invalidate();
+            }
+        });
+    }
+
+    // Public API
+    public void setOnBoundsChangedListener(OnBoundsChangedListener listener) {
+        this.listener = listener;
+    }
+
+    public RectF getBounds() {
+        return new RectF(bounds);
+    }
+
+    public void setBounds(RectF newBounds) {
+        bounds.set(newBounds);
+        constrainToView();
+        invalidate();
+        notifyListener();
+    }
+
+    @Override
+    protected void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
+
+        // Draw semi-transparent overlay inside selection
+        canvas.drawRect(bounds, shadePaint);
+
+        // Draw border rectangle
+        canvas.drawRect(bounds, borderPaint);
+
+        // Draw crosshair at center (during pinch zoom)
+        if (showCrosshair) {
+            float cx = bounds.centerX();
+            float cy = bounds.centerY();
+            canvas.drawLine(cx - 20, cy, cx + 20, cy, crosshairPaint);
+            canvas.drawLine(cx, cy - 20, cx, cy + 20, crosshairPaint);
+        }
+
+        // Draw corner/edge handles
+        if (showHandles) {
+            drawHandle(canvas, bounds.left, bounds.top);           // Top-left
+            drawHandle(canvas, bounds.right, bounds.top);          // Top-right
+            drawHandle(canvas, bounds.left, bounds.bottom);        // Bottom-left
+            drawHandle(canvas, bounds.right, bounds.bottom);       // Bottom-right
+            drawHandle(canvas, bounds.centerX(), bounds.top);      // Top-center
+            drawHandle(canvas, bounds.centerX(), bounds.bottom);   // Bottom-center
+            drawHandle(canvas, bounds.left, bounds.centerY());     // Left-center
+            drawHandle(canvas, bounds.right, bounds.centerY());    // Right-center
+        }
+
+        // Draw size label
+        String sizeLabel = String.format("%.0f × %.0f", bounds.width(), bounds.height());
+        float labelY = bounds.top - 10f;
+        if (labelY < textPaint.getTextSize()) {
+            labelY = bounds.bottom + textPaint.getTextSize() + 5f;
+        }
+        canvas.drawText(sizeLabel, bounds.centerX(), labelY, textPaint);
+    }
+
+    private void drawHandle(Canvas canvas, float x, float y) {
+        canvas.drawCircle(x, y, HANDLE_RADIUS, handlePaint);
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        // Let scale detector handle multi-touch first
+        boolean scaledHandled = scaleDetector.onTouchEvent(event);
+
+        // If scale detector is active, don't process other gestures
+        if (currentMode == Mode.PINCH_ZOOM) {
+            if (event.getActionMasked() == MotionEvent.ACTION_UP ||
+                    event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+                currentMode = Mode.NONE;
+            }
+            return true;
+        }
+
+        // Handle single-touch gestures
+        float x = event.getX();
+        float y = event.getY();
+
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                currentMode = hitTest(x, y);
+                lastX = x;
+                lastY = y;
+                showHandles = true;
                 invalidate();
                 return true;
+
+            case MotionEvent.ACTION_MOVE:
+                if (currentMode != Mode.NONE) {
+                    float dx = x - lastX;
+                    float dy = y - lastY;
+                    applyDrag(dx, dy);
+                    lastX = x;
+                    lastY = y;
+                    invalidate();
+                    notifyListener();
+                    return true;
+                }
+                break;
+
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
-                mode = Mode.NONE;
+                currentMode = Mode.NONE;
+                showHandles = true;
+                invalidate();
                 return true;
         }
-        return super.onTouchEvent(e);
+
+        return scaledHandled || super.onTouchEvent(event);
     }
 
+    /**
+     * Determine what part of the rectangle was touched
+     */
     private Mode hitTest(float x, float y) {
-        boolean L = Math.abs(x - bounds.left)   <= EDGE;
-        boolean R = Math.abs(x - bounds.right)  <= EDGE;
-        boolean T = Math.abs(y - bounds.top)    <= EDGE;
-        boolean B = Math.abs(y - bounds.bottom) <= EDGE;
-        if (L && T) return Mode.RESIZE_LT;
-        if (R && T) return Mode.RESIZE_RT;
-        if (L && B) return Mode.RESIZE_LB;
-        if (R && B) return Mode.RESIZE_RB;
-        if (L) return Mode.RESIZE_L;
-        if (R) return Mode.RESIZE_R;
-        if (T) return Mode.RESIZE_T;
-        if (B) return Mode.RESIZE_B;
+        boolean nearLeft = Math.abs(x - bounds.left) <= EDGE_TOUCH_THRESHOLD;
+        boolean nearRight = Math.abs(x - bounds.right) <= EDGE_TOUCH_THRESHOLD;
+        boolean nearTop = Math.abs(y - bounds.top) <= EDGE_TOUCH_THRESHOLD;
+        boolean nearBottom = Math.abs(y - bounds.bottom) <= EDGE_TOUCH_THRESHOLD;
+
+        // Check corners first (higher priority)
+        if (nearLeft && nearTop) return Mode.RESIZE_LT;
+        if (nearRight && nearTop) return Mode.RESIZE_RT;
+        if (nearLeft && nearBottom) return Mode.RESIZE_LB;
+        if (nearRight && nearBottom) return Mode.RESIZE_RB;
+
+        // Check edges
+        if (nearLeft) return Mode.RESIZE_L;
+        if (nearRight) return Mode.RESIZE_R;
+        if (nearTop) return Mode.RESIZE_T;
+        if (nearBottom) return Mode.RESIZE_B;
+
+        // Check if inside rectangle (move mode)
         if (bounds.contains(x, y)) return Mode.MOVE;
+
         return Mode.NONE;
     }
 
+    /**
+     * Apply drag transformation based on current mode
+     */
     private void applyDrag(float dx, float dy) {
-        RectF b = bounds;
-        switch (mode) {
-            case MOVE: b.offset(dx, dy); break;
-            case RESIZE_L: b.left += dx; break;
-            case RESIZE_R: b.right += dx; break;
-            case RESIZE_T: b.top += dy; break;
-            case RESIZE_B: b.bottom += dy; break;
-            case RESIZE_LT: b.left += dx; b.top += dy; break;
-            case RESIZE_RT: b.right += dx; b.top += dy; break;
-            case RESIZE_LB: b.left += dx; b.bottom += dy; break;
-            case RESIZE_RB: b.right += dx; b.bottom += dy; break;
-            case NONE: default: break;
+        switch (currentMode) {
+            case MOVE:
+                bounds.offset(dx, dy);
+                break;
+            case RESIZE_L:
+                bounds.left += dx;
+                break;
+            case RESIZE_R:
+                bounds.right += dx;
+                break;
+            case RESIZE_T:
+                bounds.top += dy;
+                break;
+            case RESIZE_B:
+                bounds.bottom += dy;
+                break;
+            case RESIZE_LT:
+                bounds.left += dx;
+                bounds.top += dy;
+                break;
+            case RESIZE_RT:
+                bounds.right += dx;
+                bounds.top += dy;
+                break;
+            case RESIZE_LB:
+                bounds.left += dx;
+                bounds.bottom += dy;
+                break;
+            case RESIZE_RB:
+                bounds.right += dx;
+                bounds.bottom += dy;
+                break;
+            default:
+                return;
         }
-        float minW = 40f, minH = 40f;
-        if (b.width() < minW) { b.right = b.left + minW; }
-        if (b.height() < minH){ b.bottom = b.top + minH; }
-        float w = getWidth(), h = getHeight();
-        if (b.left < 0) { float d = -b.left; b.offset(d,0); }
-        if (b.top  < 0) { float d = -b.top;  b.offset(0,d); }
-        if (b.right > w)  { float d = b.right - w;  b.offset(-d,0); }
-        if (b.bottom > h) { float d = b.bottom - h; b.offset(0,-d); }
+
+        // Apply minimum size constraint
+        if (bounds.width() < MIN_SIZE) {
+            if (currentMode == Mode.RESIZE_L || currentMode == Mode.RESIZE_LT || currentMode == Mode.RESIZE_LB) {
+                bounds.left = bounds.right - MIN_SIZE;
+            } else {
+                bounds.right = bounds.left + MIN_SIZE;
+            }
+        }
+
+        if (bounds.height() < MIN_SIZE) {
+            if (currentMode == Mode.RESIZE_T || currentMode == Mode.RESIZE_LT || currentMode == Mode.RESIZE_RT) {
+                bounds.top = bounds.bottom - MIN_SIZE;
+            } else {
+                bounds.bottom = bounds.top + MIN_SIZE;
+            }
+        }
+
+        // Keep within view bounds
+        constrainToView();
+    }
+
+    /**
+     * Ensure rectangle stays within view bounds
+     */
+    private void constrainToView() {
+        float viewWidth = getWidth();
+        float viewHeight = getHeight();
+
+        if (viewWidth == 0 || viewHeight == 0) return;
+
+        // Constrain to view bounds
+        if (bounds.left < 0) {
+            float shift = -bounds.left;
+            bounds.offset(shift, 0);
+        }
+
+        if (bounds.top < 0) {
+            float shift = -bounds.top;
+            bounds.offset(0, shift);
+        }
+
+        if (bounds.right > viewWidth) {
+            float shift = bounds.right - viewWidth;
+            bounds.offset(-shift, 0);
+        }
+
+        if (bounds.bottom > viewHeight) {
+            float shift = bounds.bottom - viewHeight;
+            bounds.offset(0, -shift);
+        }
+
+        // If rectangle is larger than view (shouldn't happen, but just in case)
+        if (bounds.width() > viewWidth) {
+            bounds.right = bounds.left + viewWidth;
+        }
+
+        if (bounds.height() > viewHeight) {
+            bounds.bottom = bounds.top + viewHeight;
+        }
+    }
+
+    /**
+     * Notify listener of bounds change
+     */
+    private void notifyListener() {
+        if (listener != null) {
+            listener.onChanged(getBounds());
+        }
+    }
+
+    /**
+     * Enable/disable hardware acceleration layer for smoother performance
+     */
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        setLayerType(View.LAYER_TYPE_HARDWARE, null);
     }
 }

@@ -1,9 +1,9 @@
 /*******************************************************************
- * @title FLIR Atlas Android SDK
+ * @title FLIR Atlas Android SDK - OPTIMIZED
  * @file CameraHandler.java
  * @Author Teledyne FLIR
  *
- * @brief Helper class that encapsulates *most* interactions with a FLIR ONE camera
+ * @brief Optimized helper class for real-time FLIR ONE camera streaming
  *
  * Copyright 2023:    Teledyne FLIR
  ********************************************************************/
@@ -11,6 +11,8 @@ package com.samples.flironecamera;
 
 import android.graphics.Bitmap;
 import android.util.Log;
+import android.os.Handler;
+import android.os.HandlerThread;
 
 import com.flir.thermalsdk.androidsdk.image.BitmapAndroid;
 import com.flir.thermalsdk.image.ThermalImage;
@@ -29,283 +31,390 @@ import com.flir.thermalsdk.live.streaming.ThermalStreamer;
 import com.flir.thermalsdk.image.Point;
 import com.flir.thermalsdk.image.ThermalValue;
 
-
-
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.util.LinkedList;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Encapsulates the handling of a FLIR ONE camera or built in emulator, discovery, connecting and start receiving images.
- * All listeners are called from Atlas Android SDK on a non-ui thread
- * <p/>
- * Usage:
- * <pre>
- * Start discovery of FLIR FLIR ONE cameras or built in FLIR ONE cameras emulators
- * {@linkplain #startDiscovery(DiscoveryEventListener, DiscoveryStatus)}
- * Use a discovered Camera {@linkplain Identity} and connect to the Camera
- * (note that calling connect is blocking and it is mandatory to call this function from a background thread):
- * {@linkplain #connect(Identity, ConnectionStatusListener)}
- * Once connected to a camera
- * {@linkplain #startStream(StreamDataListener)}
- * </pre>
- * <p/>
- * You don't *have* to specify your application to listen or USB intents but it might be beneficial for you application,
- * we are enumerating the USB devices during the discovery process which eliminates the need to listen for USB intents.
- * See the Android documentation about USB Host mode for more information
- * <p/>
- * Please note, this is <b>NOT</b> production quality code, error handling has been kept to a minimum to keep the code as clear and concise as possible
+ * OPTIMIZED CameraHandler with:
+ * - Frame skipping to prevent UI blocking
+ * - Background thread processing
+ * - Lightweight sampling for temperature readings
+ * - Reduced memory allocations
  */
 class CameraHandler {
 
     private static final String TAG = "CameraHandler";
 
+    // Performance tuning constants
+    private static final long MIN_FRAME_INTERVAL_MS = 100; // Max 10 FPS to UI
+    private static final int TEMP_SAMPLE_STRIDE = 8; // Sample every 8th pixel
+    private static final int TEMP_UPDATE_EVERY_N_FRAMES = 3; // Update temp every 3rd frame
+
     private StreamDataListener streamDataListener;
-    // --- Last frame min/max temperatures (Celsius) ---
+
+    // Temperature tracking with atomic operations for thread safety
     private volatile double lastMinTempC = Double.NaN;
     private volatile double lastMaxTempC = Double.NaN;
-
     private volatile float[] lastTempCBuffer = null;
     private volatile int lastW = 0, lastH = 0;
+
+    // Frame management
+    private final AtomicLong lastFrameTime = new AtomicLong(0);
+    private final AtomicBoolean isProcessing = new AtomicBoolean(false);
+    private int frameCounter = 0;
+
+    // Background processing thread
+    private HandlerThread processingThread;
+    private Handler processingHandler;
+
+    // Camera components
+    private LinkedList<Identity> foundCameraIdentities = new LinkedList<>();
+    private Camera camera;
+    private Stream connectedStream;
+    private ThermalStreamer streamer;
+    private volatile boolean rawIsKelvin = true;
 
     public double getLastMinTempC() { return lastMinTempC; }
     public double getLastMaxTempC() { return lastMaxTempC; }
 
-    // Immutable snapshot you can use after capture
-    static class TempFrameSnapshot {
-        final float[] tempC; // length = w*h, row-major
-        final int w, h;
-        TempFrameSnapshot(float[] tempC, int w, int h) { this.tempC = tempC; this.w = w; this.h = h; }
+    private double toCelsius(double v) {
+        return rawIsKelvin ? (v - 273.15) : v;
     }
 
-    // Thread-safe snapshot getter (returns null if no frame yet)
+
+    // Immutable snapshot class
+    public static class TempFrameSnapshot {
+        public final float[] tempC;
+        public final int w, h;
+        public final double minC, maxC;
+
+        public TempFrameSnapshot(float[] tempC, int w, int h, double minC, double maxC) {
+            this.tempC = tempC;
+            this.w = w;
+            this.h = h;
+            this.minC = minC;
+            this.maxC = maxC;
+        }
+    }
+
     public synchronized TempFrameSnapshot getLastTempFrameSnapshot() {
         if (lastTempCBuffer == null || lastW <= 0 || lastH <= 0) return null;
-        return new TempFrameSnapshot(lastTempCBuffer.clone(), lastW, lastH);
+        return new TempFrameSnapshot(lastTempCBuffer.clone(), lastW, lastH, lastMinTempC, lastMaxTempC);
     }
 
-
     public interface StreamDataListener {
-        void images(FrameDataHolder dataHolder);
-
         void images(Bitmap msxBitmap, Bitmap dcBitmap);
     }
 
-    //Discovered FLIR cameras
-    LinkedList<Identity> foundCameraIdentities = new LinkedList<>();
-
-    //A FLIR Camera
-    private Camera camera;
-
-    private Stream connectedStream;
-    private ThermalStreamer streamer;
-
-
     public interface DiscoveryStatus {
         void started();
-
         void stopped();
     }
 
     public CameraHandler() {
-        Log.d(TAG, "CameraHandler constr");
+        Log.d(TAG, "CameraHandler initialized");
+        initProcessingThread();
     }
 
-    /**
-     * Start discovery of USB and Emulators
-     */
+    private void initProcessingThread() {
+        processingThread = new HandlerThread("ThermalProcessing");
+        processingThread.start();
+        processingHandler = new Handler(processingThread.getLooper());
+    }
+
     public void startDiscovery(DiscoveryEventListener cameraDiscoveryListener, DiscoveryStatus discoveryStatus) {
-        DiscoveryFactory.getInstance().scan(cameraDiscoveryListener, CommunicationInterface.EMULATOR, CommunicationInterface.USB);
+        DiscoveryFactory.getInstance().scan(cameraDiscoveryListener,
+                CommunicationInterface.EMULATOR, CommunicationInterface.USB);
         discoveryStatus.started();
     }
 
-    /**
-     * Stop discovery of USB and Emulators
-     */
     public void stopDiscovery(DiscoveryStatus discoveryStatus) {
         DiscoveryFactory.getInstance().stop(CommunicationInterface.EMULATOR, CommunicationInterface.USB);
         discoveryStatus.stopped();
     }
 
     public synchronized void connect(Identity identity, ConnectionStatusListener connectionStatusListener) throws IOException {
-        Log.d(TAG, "connect identity: " + identity);
+        Log.d(TAG, "Connecting to: " + identity);
         camera = new Camera();
         camera.connect(identity, connectionStatusListener, new ConnectParameters());
     }
 
     public synchronized void disconnect() {
-        Log.d(TAG, "disconnect");
-        if (camera == null) {
-            return;
-        }
-        if (connectedStream == null) {
-            return;
-        }
+        Log.d(TAG, "Disconnecting");
 
-        if (connectedStream.isStreaming()) {
+        if (connectedStream != null && connectedStream.isStreaming()) {
             connectedStream.stop();
         }
-        camera.disconnect();
-        camera = null;
+
+        if (camera != null) {
+            camera.disconnect();
+            camera = null;
+        }
+
+        if (processingThread != null) {
+            processingThread.quitSafely();
+            processingThread = null;
+            processingHandler = null;
+        }
     }
 
     public synchronized void performNuc() {
-        Log.d(TAG, "performNuc");
-        if (camera == null) {
-            return;
-        }
+        if (camera == null) return;
+
         RemoteControl rc = camera.getRemoteControl();
-        if (rc == null) {
-            return;
-        }
+        if (rc == null) return;
+
         Calibration calib = rc.getCalibration();
-        if (calib == null) {
-            return;
+        if (calib != null) {
+            calib.nuc().executeSync();
         }
-        calib.nuc().executeSync();
     }
 
-
-
     /**
-     * Start a stream of {@link ThermalImage}s images from a FLIR ONE or emulator
+     * OPTIMIZED stream start with frame skipping and background processing
      */
     public synchronized void startStream(StreamDataListener listener) {
         this.streamDataListener = listener;
+
         if (camera == null || !camera.isConnected()) {
-            Log.e(TAG, "startStream, failed, camera was null or not connected");
+            Log.e(TAG, "Camera not connected");
             return;
         }
+
         connectedStream = camera.getStreams().get(0);
-        if (connectedStream.isThermal()) {
-            streamer = new ThermalStreamer(connectedStream);
-        } else {
-            Log.e(TAG, "startStream, failed, no thermal stream available for the camera");
+
+        if (!connectedStream.isThermal()) {
+            Log.e(TAG, "No thermal stream available");
             return;
         }
+
+        streamer = new ThermalStreamer(connectedStream);
 
         connectedStream.start(
                 unused -> {
+                    // FRAME SKIPPING: Only process if enough time has passed
+                    long currentTime = System.currentTimeMillis();
+                    long lastTime = lastFrameTime.get();
+
+                    if (currentTime - lastTime < MIN_FRAME_INTERVAL_MS) {
+                        return; // Skip this frame
+                    }
+
+                    // Check if previous frame is still processing
+                    if (isProcessing.get()) {
+                        return; // Skip if still busy
+                    }
+
+                    isProcessing.set(true);
+                    lastFrameTime.set(currentTime);
+                    frameCounter++;
+
                     streamer.update();
 
-                    final Bitmap[] dcBitmap = new Bitmap[1];
-
-                    // Touch the radiometric image to (a) grab a visible photo for MSX and
-                    // (b) compute min/max temperature from the radiometric pixels.
-                    streamer.withThermalImage((ThermalImage thermalImage) -> {
-                        // --- (A) Optional: set parameters if you need better accuracy ---
-                        // If your app has these values, set them here:
-                        // thermalImage.getParameters().setEmissivity(0.95f);
-                        // thermalImage.getParameters().setReflectedTemperature(20.0);
-                        // thermalImage.getParameters().setAtmosphericTemperature(20.0);
-                        // thermalImage.getParameters().setObjectDistance(1.0f);
-
-                        // --- (B) Compute min/max temperature by sampling pixels ---
-                        try {
-                            int w = thermalImage.getWidth();
-                            int h = thermalImage.getHeight();
-
-                            // Sample stride keeps CPU low while staying accurate
-                            int stepX = Math.max(1, w / 160);
-                            int stepY = Math.max(1, h / 120);
-
-                            double minRaw = Double.POSITIVE_INFINITY;
-                            double maxRaw = Double.NEGATIVE_INFINITY;
-
-                            // Read radiometric values using Point
-                            for (int y = 0; y < h; y += stepY) {
-                                for (int x = 0; x < w; x += stepX) {
-                                    ThermalValue tv = thermalImage.getValueAt(new Point(x, y));
-                                    double v = (tv != null) ? tv.value : Double.NaN; // raw numeric value
-                                    if (Double.isNaN(v)) continue;
-                                    if (v < minRaw) minRaw = v;
-                                    if (v > maxRaw) maxRaw = v;
-                                }
-                            }
-
-                            // Convert to Celsius using a safe heuristic:
-                            // Many builds return Kelvin by default (values > ~200). If so, K -> °C.
-                            double minC = (minRaw > 200.0) ? (minRaw - 273.15) : minRaw;
-                            double maxC = (maxRaw > 200.0) ? (maxRaw - 273.15) : maxRaw;
-
-                            lastMinTempC = minC;
-                            lastMaxTempC = maxC;
-                        } catch (Throwable t) {
-                            Log.w(TAG, "Unable to compute min/max temperature", t);
-                            lastMinTempC = Double.NaN;
-                            lastMaxTempC = Double.NaN;
-                        }
-
-
-                        // --- (D) Visible photo for MSX/preview pairing (same as your code) ---
-                        try {
-                            dcBitmap[0] = BitmapAndroid.createBitmap(
-                                    Objects.requireNonNull(
-                                            Objects.requireNonNull(thermalImage.getFusion()).getPhoto()
-                                    )
-                            ).getBitMap();
-                        } catch (Throwable t) {
-                            Log.w(TAG, "Unable to extract DC photo", t);
-                            dcBitmap[0] = null;
-                        }
-                    });
-
-                    // Colorized thermal/MSX bitmap (same as your code)
-                    final Bitmap thermalPixels = BitmapAndroid.createBitmap(streamer.getImage()).getBitMap();
-
-                    streamDataListener.images(thermalPixels, dcBitmap[0]);
+                    // Process frame on background thread
+                    processingHandler.post(() -> processFrame());
                 },
-                error -> Log.e(TAG, "Streaming error: " + error));
+                error -> {
+                    Log.e(TAG, "Stream error: " + error);
+                    isProcessing.set(false);
+                }
+        );
+    }
+
+    /**
+     * OPTIMIZED frame processing - runs on background thread
+     */
+    private void processFrame() {
+        try {
+            final Bitmap[] bitmaps = new Bitmap[2]; // [0]=thermal, [1]=visible
+
+            streamer.withThermalImage(thermalImage -> {
+                try {
+                    // Extract thermal bitmap (fast operation)
+                    bitmaps[0] = BitmapAndroid.createBitmap(streamer.getImage()).getBitMap();
+
+                    // Extract visible photo for MSX
+                    try {
+                        bitmaps[1] = BitmapAndroid.createBitmap(
+                                Objects.requireNonNull(
+                                        Objects.requireNonNull(thermalImage.getFusion()).getPhoto()
+                                )
+                        ).getBitMap();
+                    } catch (Exception e) {
+                        Log.w(TAG, "No visible photo available");
+                        bitmaps[1] = null;
+                    }
+
+                    // LIGHTWEIGHT temperature update (every Nth frame only)
+                    if (frameCounter % TEMP_UPDATE_EVERY_N_FRAMES == 0) {
+                        updateTemperatureData(thermalImage);
+                    }
+
+                } catch (Exception e) {
+                    Log.e(TAG, "Error processing thermal image", e);
+                }
+            });
+
+            // Deliver to UI (listener should be UI-thread safe)
+            if (streamDataListener != null && bitmaps[0] != null) {
+                streamDataListener.images(bitmaps[0], bitmaps[1]);
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "Frame processing error", e);
+        } finally {
+            isProcessing.set(false);
+        }
+    }
+
+    /**
+     * LIGHTWEIGHT temperature sampling - uses stride to reduce CPU load
+     */
+    private void updateTemperatureData(ThermalImage thermalImage) {
+        try {
+            int w = thermalImage.getWidth();
+            int h = thermalImage.getHeight();
+            if (w <= 0 || h <= 0) return;
+
+            // Detect unit on this frame from a quick sample
+            int samples = 0, kelvinLike = 0;
+            for (int y = 0; y < h && samples < 100; y += Math.max(1, h / 20)) {
+                for (int x = 0; x < w && samples < 100; x += Math.max(1, w / 20)) {
+                    ThermalValue tv = thermalImage.getValueAt(new Point(x, y));
+                    if (tv == null) continue;
+                    double v = tv.value;
+                    if (Double.isNaN(v)) continue;
+                    // Heuristic: typical ambient temps ~250–340 K vs -50..150 °C
+                    if (v > 150 && v < 400) kelvinLike++;
+                    samples++;
+                }
+            }
+            rawIsKelvin = (kelvinLike > samples / 2);
+
+            double minC = Double.POSITIVE_INFINITY;
+            double maxC = Double.NEGATIVE_INFINITY;
+
+            for (int y = 0; y < h; y += TEMP_SAMPLE_STRIDE) {
+                for (int x = 0; x < w; x += TEMP_SAMPLE_STRIDE) {
+                    ThermalValue tv = thermalImage.getValueAt(new Point(x, y));
+                    if (tv == null) continue;
+                    double v = tv.value;
+                    if (Double.isNaN(v)) continue;
+                    double c = toCelsius(v);
+                    if (c < minC) minC = c;
+                    if (c > maxC) maxC = c;
+                }
+            }
+
+            lastMinTempC = minC;
+            lastMaxTempC = maxC;
+
+        } catch (Exception e) {
+            Log.w(TAG, "Temperature update failed", e);
+        }
     }
 
 
     /**
-     * Add a found camera to the list of known cameras
+     * Build full temperature snapshot (for capture/save operations)
+     * This is the HEAVY operation - only call when actually needed!
      */
+    public TempFrameSnapshot buildTempSnapshotSync() throws Exception {
+        if (streamer == null) throw new IllegalStateException("Streamer not initialized");
+
+        final TempFrameSnapshot[] result = new TempFrameSnapshot[1];
+        final Exception[] error = new Exception[1];
+
+        streamer.withThermalImage(thermalImage -> {
+            try {
+                int w = thermalImage.getWidth();
+                int h = thermalImage.getHeight();
+                float[] buf = new float[w * h];
+
+                // Detect unit for THIS snapshot
+                int samples = 0, kelvinLike = 0;
+                for (int y = 0; y < h && samples < 100; y += Math.max(1, h / 20)) {
+                    for (int x = 0; x < w && samples < 100; x += Math.max(1, w / 20)) {
+                        ThermalValue tv = thermalImage.getValueAt(new Point(x, y));
+                        if (tv == null) continue;
+                        double v = tv.value;
+                        if (Double.isNaN(v)) continue;
+                        if (v > 150 && v < 400) kelvinLike++;
+                        samples++;
+                    }
+                }
+                boolean snapshotKelvin = (kelvinLike > samples / 2);
+
+                double minC = Double.POSITIVE_INFINITY;
+                double maxC = Double.NEGATIVE_INFINITY;
+
+                for (int y = 0; y < h; y++) {
+                    int off = y * w;
+                    for (int x = 0; x < w; x++) {
+                        ThermalValue tv = thermalImage.getValueAt(new Point(x, y));
+                        double v = (tv != null) ? tv.value : Double.NaN;
+                        if (Double.isNaN(v)) continue;
+                        double c = snapshotKelvin ? (v - 273.15) : v; // consistent for this snapshot
+                        buf[off + x] = (float) c;
+                        if (c < minC) minC = c;
+                        if (c > maxC) maxC = c;
+                    }
+                }
+
+                result[0] = new TempFrameSnapshot(buf, w, h, minC, maxC);
+
+            } catch (Exception e) {
+                error[0] = e;
+            }
+        });
+
+        if (error[0] != null) throw error[0];
+        return result[0];
+    }
+
+
     public void add(Identity identity) {
         foundCameraIdentities.add(identity);
     }
 
     @Nullable
     public Identity getCppEmulator() {
-        for (Identity foundCameraIdentity : foundCameraIdentities) {
-            if (foundCameraIdentity.deviceId.contains("C++ Emulator")) {
-                return foundCameraIdentity;
-            }
+        for (Identity id : foundCameraIdentities) {
+            if (id.deviceId.contains("C++ Emulator")) return id;
         }
         return null;
     }
 
     @Nullable
     public Identity getFlirOneEmulator() {
-        for (Identity foundCameraIdentity : foundCameraIdentities) {
-            if (foundCameraIdentity.deviceId.contains("EMULATED FLIR ONE")) {
-                return foundCameraIdentity;
-            }
+        for (Identity id : foundCameraIdentities) {
+            if (id.deviceId.contains("EMULATED FLIR ONE")) return id;
         }
         return null;
     }
 
     @Nullable
     public Identity getFlirOne() {
-        return foundCameraIdentities.stream().filter(identity -> identity.communicationInterface == CommunicationInterface.USB).findFirst().orElse(null);
+        return foundCameraIdentities.stream()
+                .filter(identity -> identity.communicationInterface == CommunicationInterface.USB)
+                .findFirst()
+                .orElse(null);
     }
 
     public String getDeviceInfo() {
-        if (camera == null) {
-            return "N/A";
-        }
+        if (camera == null) return "N/A";
+
         RemoteControl rc = camera.getRemoteControl();
-        if (rc == null) {
-            return "N/A";
-        }
+        if (rc == null) return "N/A";
+
         CameraInformation ci = rc.cameraInformation().getSync();
-        if (ci == null) {
-            return "N/A";
-        }
+        if (ci == null) return "N/A";
+
         return ci.displayName + ", SN: " + ci.serialNumber;
     }
-
 }

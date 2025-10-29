@@ -1,20 +1,24 @@
 /*
  * ******************************************************************
- * @title FLIR Atlas Android SDK
+ * @title FLIR Atlas Android SDK - OPTIMIZED
  * @file MainActivity.java
  * @Author Teledyne FLIR
  *
- * @brief  Main UI of test application
+ * @brief  Optimized Main UI with efficient frame handling
  *
  * Copyright 2023:    Teledyne FLIR
  * ******************************************************************/
 package com.samples.flironecamera;
 
 import android.graphics.Bitmap;
+import android.graphics.RectF;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -33,60 +37,58 @@ import com.flir.thermalsdk.live.discovery.DiscoveryEventListener;
 import com.flir.thermalsdk.log.ThermalLog;
 
 import java.io.IOException;
-import java.util.Objects;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Sample application for scanning a FLIR ONE or a built in emulator
- * <p>
- * See the {@link CameraHandler} for how to preform discovery of a FLIR ONE camera, connecting to it and start streaming images
- * <p>
- * The MainActivity is primarily focused to "glue" different helper classes together and updating the UI components
- * <p/>
- * Please note, this is <b>NOT</b> production quality code, error handling has been kept to a minimum to keep the code as clear and concise as possible
+ * OPTIMIZED MainActivity with:
+ * - Efficient frame buffering
+ * - Proper UI thread management
+ * - Reduced memory allocations
+ * - Frame capture with thermal data snapshot
  */
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
+    private static final int UI_UPDATE_INTERVAL_MS = 50; // ~20 FPS UI cap
 
-    //Handles network camera operations
+    // Camera handler
     private CameraHandler cameraHandler;
-
     private Identity connectedIdentity = null;
+
+    // UI components
     private TextView connectionStatus;
     private TextView discoveryStatus;
     private TextView deviceInfo;
-
     private ImageView msxImage;
     private ImageView photoImage;
-    private Bitmap lastCapturedMsx;
-    private volatile FrameDataHolder latestFrame = null;
 
-    private final LinkedBlockingQueue<FrameDataHolder> framesBuffer = new LinkedBlockingQueue<>(21);
+    // Frame management - using volatile for thread safety
+    private volatile Bitmap lastMsxBitmap;
+    private volatile Bitmap lastDcBitmap;
+    private final AtomicBoolean isUpdatingUI = new AtomicBoolean(false);
+    private long lastUiUpdateMs = 0;
+
+    // Capture state
+    private Bitmap capturedMsxBitmap;
+    private CameraHandler.TempFrameSnapshot capturedTempSnapshot;
+    private final AtomicBoolean isCapturing = new AtomicBoolean(false);
+
+    // USB permission handler
     private final UsbPermissionHandler usbPermissionHandler = new UsbPermissionHandler();
-    private CameraHandler.TempFrameSnapshot lastTempSnapshot; // frozen at capture time
 
-
-    /**
-     * Show message on the screen
-     */
-    public interface ShowMessage {
-        void show(String message);
-    }
+    // UI Handler for throttled updates
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private final Runnable updateUIRunnable = this::updateUIWithLatestFrame;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        //ThermalSdkAndroid has to be initiated from a Activity with the Application Context to prevent leaking Context,
-        // and before ANY using any ThermalSdkAndroid functions
-        //ThermalLog will show log from the Atlas Android SDK in standards android log framework
-        ThermalSdkAndroid.init(getApplicationContext(), ThermalLog.LogLevel.DEBUG);
-
+        // Initialize Thermal SDK
+        ThermalSdkAndroid.init(getApplicationContext(), ThermalLog.LogLevel.WARNING); // Changed to WARNING to reduce log spam
 
         cameraHandler = new CameraHandler();
-
         setupViews();
 
         showSDKversion(ThermalSdkAndroid.getVersion());
@@ -96,10 +98,19 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onStop() {
         super.onStop();
-        Log.d(TAG, "onStop()");
-        //Always close the connection with a connected FLIR ONE when going into background
+        Log.d(TAG, "onStop() - Disconnecting camera");
         disconnect();
+        uiHandler.removeCallbacks(updateUIRunnable);
     }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        // Clean up bitmaps to prevent memory leaks
+        recycleBitmaps();
+    }
+
+    // ==================== Button Click Handlers ====================
 
     public void startDiscovery(View view) {
         startDiscovery();
@@ -130,83 +141,373 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * Connect to a Camera
+     * OPTIMIZED frame capture with thermal data snapshot
      */
+    public void captureFrame(View view) {
+        if (lastMsxBitmap == null) {
+            showMessage.show("No frame available yet");
+            return;
+        }
+
+        // Prevent multiple simultaneous captures
+        if (!isCapturing.compareAndSet(false, true)) {
+            showMessage.show("Capture already in progress...");
+            return;
+        }
+
+        // Show progress indicator
+        showMessage.show("Capturing thermal data...");
+
+        // Capture on background thread to avoid UI lag
+        new Thread(() -> {
+            try {
+                // 1. Copy the displayed MSX bitmap (fast)
+                Bitmap msxCopy = copyBitmap(lastMsxBitmap);
+
+                // 2. Build full temperature snapshot (HEAVY - runs on background thread)
+                CameraHandler.TempFrameSnapshot tempSnap = cameraHandler.buildTempSnapshotSync();
+
+                // 3. Get min/max temperatures
+                double minC = cameraHandler.getLastMinTempC();
+                double maxC = cameraHandler.getLastMaxTempC();
+
+                // Store for dialog
+                capturedMsxBitmap = msxCopy;
+                capturedTempSnapshot = tempSnap;
+
+                // 4. Save to gallery (background)
+                String filename = "FLIR_MSX_" + System.currentTimeMillis() + ".jpg";
+                saveBitmapToGallery(msxCopy, filename);
+
+                // 5. Show preview dialog on UI thread
+                runOnUiThread(() -> {
+                    if (tempSnap != null) {
+                        showCapturePopupWithRoi(msxCopy, minC, maxC, tempSnap);
+                    } else {
+                        showMessage.show("Capture saved, but thermal data unavailable");
+                    }
+                });
+
+            } catch (Exception e) {
+                Log.e(TAG, "Capture error", e);
+                runOnUiThread(() -> showMessage.show("Capture failed: " + e.getMessage()));
+            } finally {
+                isCapturing.set(false);
+            }
+        }).start();
+    }
+
+    // ==================== Camera Connection ====================
+
     private void connect(Identity identity) {
-        //We don't have to stop a discovery but it's nice to do if we have found the camera that we are looking for
         cameraHandler.stopDiscovery(discoveryStatusListener);
 
         if (connectedIdentity != null) {
-            Log.d(TAG, "connect(), in *this* code sample we only support one camera connection at the time");
-            showMessage.show("connect(), in *this* code sample we only support one camera connection at the time");
+            showMessage.show("Already connected to a camera");
             return;
         }
 
         if (identity == null) {
-            Log.d(TAG, "connect(), can't connect, no camera available");
-            showMessage.show("connect(), can't connect, no camera available");
+            showMessage.show("No camera available to connect");
             return;
         }
 
         connectedIdentity = identity;
-
-        Log.d(TAG, "connectedIdentity: " + connectedIdentity);
-
         updateConnectionText(identity, "CONNECTING");
-        //IF your using "USB_DEVICE_ATTACHED" and "usb-device vendor-id" in the Android Manifest
-        // you don't need to request permission, see documentation for more information
+
         if (UsbPermissionHandler.isFlirOne(identity)) {
             usbPermissionHandler.requestFlirOnePermisson(identity, this, permissionListener);
         } else {
             doConnect(identity);
         }
-
     }
 
-    public void captureFrame(View view) {
-        FrameDataHolder last = latestFrame; // <-- read the cached latest
-        if (last == null || last.msxBitmap == null) {
-            showMessage.show("No frame available yet");
+    private void doConnect(Identity identity) {
+        new Thread(() -> {
+            try {
+                cameraHandler.connect(identity, connectionStatusListener);
+
+                runOnUiThread(() -> {
+                    updateConnectionText(identity, "CONNECTED");
+                    deviceInfo.setText(cameraHandler.getDeviceInfo());
+                });
+
+                // Start streaming with optimized listener
+                cameraHandler.startStream(streamDataListener);
+
+            } catch (IOException e) {
+                Log.e(TAG, "Connection failed", e);
+                runOnUiThread(() -> {
+                    updateConnectionText(identity, "DISCONNECTED");
+                    showMessage.show("Connection failed: " + e.getMessage());
+                });
+            }
+        }).start();
+    }
+
+    private void disconnect() {
+        if (connectedIdentity == null) return;
+
+        updateConnectionText(connectedIdentity, "DISCONNECTING");
+        connectedIdentity = null;
+
+        new Thread(() -> {
+            cameraHandler.disconnect();
+            runOnUiThread(() -> {
+                updateConnectionText(null, "DISCONNECTED");
+                recycleBitmaps(); // Clean up when disconnecting
+            });
+        }).start();
+    }
+
+    // ==================== Camera Discovery ====================
+
+    private void startDiscovery() {
+        cameraHandler.startDiscovery(cameraDiscoveryListener, discoveryStatusListener);
+    }
+
+    private void stopDiscovery() {
+        cameraHandler.stopDiscovery(discoveryStatusListener);
+    }
+
+    // ==================== Stream Data Handling (OPTIMIZED) ====================
+
+    /**
+     * OPTIMIZED stream listener - minimal work on callback thread
+     */
+    private final CameraHandler.StreamDataListener streamDataListener = new CameraHandler.StreamDataListener() {
+        @Override
+        public void images(Bitmap msxBitmap, Bitmap dcBitmap) {
+            // Just store the latest bitmaps - no UI work here
+            lastMsxBitmap = msxBitmap;
+            lastDcBitmap = dcBitmap;
+
+            // Schedule UI update (throttled)
+            long now = System.currentTimeMillis();
+            if (now - lastUiUpdateMs >= UI_UPDATE_INTERVAL_MS) {
+                lastUiUpdateMs = now;
+
+                // Remove any pending updates and post new one
+                uiHandler.removeCallbacks(updateUIRunnable);
+                uiHandler.post(updateUIRunnable);
+            }
+        }
+    };
+
+    /**
+     * Update UI with latest frame (runs on UI thread, throttled)
+     */
+    private void updateUIWithLatestFrame() {
+        // Skip if already updating
+        if (!isUpdatingUI.compareAndSet(false, true)) {
             return;
         }
 
-        // Safe copy for preview (fallback to ARGB_8888 if config is null)
-        Bitmap.Config cfg = last.msxBitmap.getConfig() != null ? last.msxBitmap.getConfig() : Bitmap.Config.RGB_565;
-        lastCapturedMsx = last.msxBitmap.copy(cfg, false);
+        try {
+            Bitmap msx = lastMsxBitmap;
+            Bitmap dc = lastDcBitmap;
 
-        // Read min/max °C computed in CameraHandler
-        double minC = cameraHandler.getLastMinTempC();
-        double maxC = cameraHandler.getLastMaxTempC();
+            if (msx != null) {
+                msxImage.setImageBitmap(msx);
+            }
 
-        saveBitmapToGallery(lastCapturedMsx, "FLIR_MSX_" + System.currentTimeMillis() + ".jpg");
-        showCapturePopup(lastCapturedMsx, minC, maxC);
+            if (dc != null) {
+                photoImage.setImageBitmap(dc);
+            }
+        } finally {
+            isUpdatingUI.set(false);
+        }
     }
 
-    private void showCapturePopup(@NonNull Bitmap bitmap, double minC, double maxC) {
+    private Bitmap colorizeBlueRed(@NonNull CameraHandler.TempFrameSnapshot snap, int outW, int outH) {
+        Bitmap out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888);
+        final float tMin = (float) snap.minC;
+        final float tMax = (float) snap.maxC;
+        final float range = Math.max(0.01f, tMax - tMin);
+
+        int[] row = new int[outW];
+        for (int y = 0; y < outH; y++) {
+            int ty = Math.min(snap.h - 1, Math.round((y / (float) outH) * (snap.h - 1)));
+            int srcRow = ty * snap.w;
+            for (int x = 0; x < outW; x++) {
+                int tx = Math.min(snap.w - 1, Math.round((x / (float) outW) * (snap.w - 1)));
+                float c = snap.tempC[srcRow + tx];
+                float n = (c - tMin) / range; n = Math.max(0f, Math.min(1f, n));
+                int r = (int)(255f * n);
+                int g = 0;
+                int b = (int)(255f * (1f - n));
+                row[x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+            }
+            out.setPixels(row, 0, outW, 0, y, outW, 1);
+        }
+        return out;
+    }
+
+
+    // ==================== Capture Preview Dialog ====================
+
+    private void showCapturePopupWithRoi(@NonNull Bitmap bitmap, double minC, double maxC,
+                                         @NonNull CameraHandler.TempFrameSnapshot snap) {
         View dialogView = getLayoutInflater().inflate(R.layout.dialog_captured_preview, null);
         ImageView imageView = dialogView.findViewById(R.id.capturedImageView);
         TextView statsText = dialogView.findViewById(R.id.tempStatsText);
         Button closeBtn = dialogView.findViewById(R.id.closeDialogBtn);
+        FrameLayout container = dialogView.findViewById(R.id.previewContainer);
 
         imageView.setImageBitmap(bitmap);
+        statsText.setText(String.format(java.util.Locale.US,
+                "High: %.1f°C   Low: %.1f°C", maxC, minC));
 
-        // Display High first, then Low (°C), 1 decimal
-        String text = (Double.isNaN(maxC) || Double.isNaN(minC))
-                ? "High: --°C   Low: --°C"
-                : String.format(java.util.Locale.US, "High: %.1f°C   Low: %.1f°C", maxC, minC);
-        statsText.setText(text);
+        // Add selection overlay
+        SelectionOverlay overlay = new SelectionOverlay(this);
+        container.addView(overlay, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
 
-        final android.app.AlertDialog dialog =
-                new android.app.AlertDialog.Builder(this)
-                        .setView(dialogView)
-                        .setCancelable(true)
-                        .create();
+        // Initialize ROI to center 40% of displayed image
+        imageView.post(() -> {
+            RectF imgRect = getDisplayedImageRect(imageView);
+            float w = imgRect.width() * 0.4f;
+            float h = imgRect.height() * 0.4f;
+            float left = imgRect.centerX() - w / 2f;
+            float top = imgRect.centerY() - h / 2f;
+            overlay.setBounds(new RectF(left, top, left + w, top + h));
+
+            // Compute initial ROI stats
+            updateRoiStats(statsText, overlay.getBounds(), imageView, bitmap, snap);
+        });
+
+        // Listen to ROI changes
+        overlay.setOnBoundsChangedListener(bounds ->
+                updateRoiStats(statsText, bounds, imageView, bitmap, snap));
+
+        // Create and show dialog
+        android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this)
+                .setView(dialogView)
+                .setCancelable(true)
+                .create();
 
         closeBtn.setOnClickListener(v -> dialog.dismiss());
-        runOnUiThread(dialog::show);
+        dialog.show();
     }
 
-    // (same save helper you already have in your project)
+    /**
+     * Update ROI temperature statistics
+     */
+    private void updateRoiStats(TextView statsText, RectF roiInView, ImageView iv,
+                                Bitmap bmp, CameraHandler.TempFrameSnapshot snap) {
+        try {
+            // Get displayed image rectangle
+            RectF imgRect = getDisplayedImageRect(iv);
+            if (!RectF.intersects(imgRect, roiInView)) return;
+
+            // Clamp ROI to displayed image bounds
+            RectF clipped = new RectF(
+                    Math.max(roiInView.left, imgRect.left),
+                    Math.max(roiInView.top, imgRect.top),
+                    Math.min(roiInView.right, imgRect.right),
+                    Math.min(roiInView.bottom, imgRect.bottom)
+            );
+
+            // Scale factors from displayed image to bitmap
+            float scaleX = (float) bmp.getWidth() / imgRect.width();
+            float scaleY = (float) bmp.getHeight() / imgRect.height();
+
+            // Map to bitmap coordinates
+            int bx0 = Math.round((clipped.left - imgRect.left) * scaleX);
+            int by0 = Math.round((clipped.top - imgRect.top) * scaleY);
+            int bx1 = Math.round((clipped.right - imgRect.left) * scaleX);
+            int by1 = Math.round((clipped.bottom - imgRect.top) * scaleY);
+
+            bx0 = clamp(bx0, 0, bmp.getWidth() - 1);
+            by0 = clamp(by0, 0, bmp.getHeight() - 1);
+            bx1 = clamp(bx1, 0, bmp.getWidth() - 1);
+            by1 = clamp(by1, 0, bmp.getHeight() - 1);
+
+            if (bx1 <= bx0 || by1 <= by0) return;
+
+            // Map to thermal grid coordinates
+            float gx = (float) snap.w / bmp.getWidth();
+            float gy = (float) snap.h / bmp.getHeight();
+
+            int tx0 = clamp(Math.round(bx0 * gx), 0, snap.w - 1);
+            int ty0 = clamp(Math.round(by0 * gy), 0, snap.h - 1);
+            int tx1 = clamp(Math.round(bx1 * gx), 0, snap.w - 1);
+            int ty1 = clamp(Math.round(by1 * gy), 0, snap.h - 1);
+
+            // Compute min/max temperature in ROI
+            float[] temps = snap.tempC;
+            double minC = Double.POSITIVE_INFINITY;
+            double maxC = Double.NEGATIVE_INFINITY;
+
+            for (int y = ty0; y <= ty1; y++) {
+                int rowOffset = y * snap.w;
+                for (int x = tx0; x <= tx1; x++) {
+                    float temp = temps[rowOffset + x];
+                    if (temp < minC) minC = temp;
+                    if (temp > maxC) maxC = temp;
+                }
+            }
+
+            if (Double.isFinite(minC) && Double.isFinite(maxC)) {
+                statsText.setText(String.format(java.util.Locale.US,
+                        "High: %.1f°C   Low: %.1f°C", maxC, minC));
+            } else {
+                statsText.setText("High: --°C   Low: --°C");
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "ROI stats calculation error", e);
+            statsText.setText("High: --°C   Low: --°C");
+        }
+    }
+
+    // ==================== Helper Methods ====================
+
+    private int clamp(int v, int lo, int hi) {
+        return Math.max(lo, Math.min(hi, v));
+    }
+
+    private RectF getDisplayedImageRect(ImageView iv) {
+        RectF out = new RectF();
+        if (iv.getDrawable() == null) return out;
+
+        android.graphics.Matrix m = iv.getImageMatrix();
+        android.graphics.RectF dRect = new android.graphics.RectF(0, 0,
+                iv.getDrawable().getIntrinsicWidth(),
+                iv.getDrawable().getIntrinsicHeight());
+        m.mapRect(out, dRect);
+
+        out.offset(iv.getPaddingLeft(), iv.getPaddingTop());
+
+        float vw = iv.getWidth();
+        float vh = iv.getHeight();
+        float dx = (vw - out.width()) / 2f;
+        float dy = (vh - out.height()) / 2f;
+        out.offset(dx, dy);
+
+        return out;
+    }
+
+    private Bitmap copyBitmap(Bitmap source) {
+        if (source == null) return null;
+        Bitmap.Config config = source.getConfig() != null ?
+                source.getConfig() : Bitmap.Config.ARGB_8888;
+        return source.copy(config, false);
+    }
+
+    private void recycleBitmaps() {
+        // Note: Be careful with recycling - only recycle if you own the bitmap
+        // FLIR SDK manages its own bitmaps, so we just null our references
+        lastMsxBitmap = null;
+        lastDcBitmap = null;
+
+        if (capturedMsxBitmap != null && !capturedMsxBitmap.isRecycled()) {
+            capturedMsxBitmap.recycle();
+            capturedMsxBitmap = null;
+        }
+    }
+
     private void saveBitmapToGallery(@NonNull Bitmap bitmap, @NonNull String displayName) {
         try {
             android.content.ContentResolver resolver = getContentResolver();
@@ -214,177 +515,98 @@ public class MainActivity extends AppCompatActivity {
             values.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, displayName);
             values.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "image/jpeg");
             values.put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FLIR");
-            android.net.Uri uri = resolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-            if (uri == null) throw new IOException("Resolver returned null Uri");
+
+            android.net.Uri uri = resolver.insert(
+                    android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+
+            if (uri == null) throw new IOException("Failed to create media store entry");
+
             try (java.io.OutputStream out = resolver.openOutputStream(uri)) {
+                if (out == null) throw new IOException("Failed to open output stream");
                 if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)) {
-                    throw new IOException("Bitmap compress failed");
+                    throw new IOException("Bitmap compression failed");
                 }
             }
-            showMessage.show("Saved: " + displayName);
+
+            Log.d(TAG, "Image saved: " + displayName);
+
         } catch (Exception e) {
-            Log.e(TAG, "saveBitmapToGallery error", e);
-            showMessage.show("Save failed: " + e.getMessage());
+            Log.e(TAG, "Save to gallery failed", e);
+            runOnUiThread(() -> showMessage.show("Save failed: " + e.getMessage()));
         }
     }
 
+    // ==================== Listeners & Callbacks ====================
 
-    private final UsbPermissionHandler.UsbPermissionListener permissionListener = new UsbPermissionHandler.UsbPermissionListener() {
-        @Override
-        public void permissionGranted(@NonNull Identity identity) {
-            doConnect(identity);
-        }
-
-        @Override
-        public void permissionDenied(@NonNull Identity identity) {
-            MainActivity.this.showMessage.show("Permission was denied for identity ");
-        }
-
-        @Override
-        public void error(UsbPermissionHandler.UsbPermissionListener.ErrorType errorType, final Identity identity) {
-            if (errorType == UsbPermissionHandler.UsbPermissionListener.ErrorType.DEVICE_UNAVAILABLE_WHEN_ASKED_PERMISSION) {
-                // automatically retry asking for permission - basically this automatic retry attempt should cause UsbPermissionListener.permissionGranted() callback to be invoked
-                usbPermissionHandler.requestFlirOnePermisson(connectedIdentity, MainActivity.this, permissionListener);
-            } else {
-                MainActivity.this.showMessage.show("Error when asking for permission for FLIR ONE, error:" + errorType + " identity:" + identity);
-            }
-        }
-    };
-
-    private void doConnect(Identity identity) {
-        new Thread(() -> {
-            try {
-                cameraHandler.connect(identity, connectionStatusListener);
-                runOnUiThread(() -> {
-                    updateConnectionText(identity, "CONNECTED");
-                    deviceInfo.setText(cameraHandler.getDeviceInfo());
-                });
-                cameraHandler.startStream(streamDataListener);
-            } catch (IOException e) {
-                runOnUiThread(() -> {
-                    Log.d(TAG, "Could not connect: " + e);
-                    updateConnectionText(identity, "DISCONNECTED");
-                });
-            }
-        }).start();
-    }
-
-    /**
-     * Disconnect to a camera
-     */
-    private void disconnect() {
-        updateConnectionText(connectedIdentity, "DISCONNECTING");
-        Log.d(TAG, "disconnect() called with: connectedIdentity = [" + connectedIdentity + "]");
-        connectedIdentity = null;
-        new Thread(() -> {
-            cameraHandler.disconnect();
-            runOnUiThread(() -> updateConnectionText(null, "DISCONNECTED"));
-        }).start();
-    }
-
-    /**
-     * Update the UI text for connection status
-     */
-    private void updateConnectionText(Identity identity, String status) {
-        String deviceId = identity != null ? identity.deviceId : "";
-        connectionStatus.setText(getString(R.string.connection_status_text, deviceId + " " + status));
-    }
-
-    /**
-     * Start camera discovery
-     */
-    private void startDiscovery() {
-        cameraHandler.startDiscovery(cameraDiscoveryListener, discoveryStatusListener);
-    }
-
-    /**
-     * Stop camera discovery
-     */
-    private void stopDiscovery() {
-        cameraHandler.stopDiscovery(discoveryStatusListener);
-    }
-
-    /**
-     * Callback for discovery status, using it to update UI
-     */
-    private final CameraHandler.DiscoveryStatus discoveryStatusListener = new CameraHandler.DiscoveryStatus() {
-        @Override
-        public void started() {
-            discoveryStatus.setText(getString(R.string.connection_status_text, "discovering"));
-        }
-
-        @Override
-        public void stopped() {
-            discoveryStatus.setText(getString(R.string.connection_status_text, "not discovering"));
-        }
-    };
-
-    /**
-     * Camera connecting state thermalImageStreamListener, keeps track of if the camera is connected or not
-     * <p>
-     * Note that callbacks are received on a non-ui thread so have to eg use {@link #runOnUiThread(Runnable)} to interact view UI components
-     */
-    private final ConnectionStatusListener connectionStatusListener = errorCode -> {
-        Log.d(TAG, "onDisconnected errorCode:" + errorCode);
-
-        runOnUiThread(() -> updateConnectionText(connectedIdentity, "DISCONNECTED"));
-    };
-
-    private final CameraHandler.StreamDataListener streamDataListener = new CameraHandler.StreamDataListener() {
-
-        @Override
-        public void images(FrameDataHolder dataHolder) {
-
-            runOnUiThread(() -> {
-                msxImage.setImageBitmap(dataHolder.msxBitmap);
-                photoImage.setImageBitmap(dataHolder.dcBitmap);
-            });
-        }
-
-        @Override
-        public void images(Bitmap msxBitmap, Bitmap dcBitmap) {
-            try {
-                framesBuffer.put(new FrameDataHolder(msxBitmap, dcBitmap));
-            } catch (InterruptedException e) {
-                Log.e(TAG, "images(), unable to add incoming images to frames buffer, exception:" + e);
-            }
-
-            runOnUiThread(() -> {
-                Log.d(TAG, "framebuffer size:" + framesBuffer.size());
-                FrameDataHolder frame = framesBuffer.poll(); // keep poll for smooth playback
-                if (frame != null) {
-                    latestFrame = frame; // <-- cache the one being shown
-                    msxImage.setImageBitmap(frame.msxBitmap);
-                    photoImage.setImageBitmap(frame.dcBitmap);
+    private final UsbPermissionHandler.UsbPermissionListener permissionListener =
+            new UsbPermissionHandler.UsbPermissionListener() {
+                @Override
+                public void permissionGranted(@NonNull Identity identity) {
+                    doConnect(identity);
                 }
-            });
-        }
+
+                @Override
+                public void permissionDenied(@NonNull Identity identity) {
+                    showMessage.show("USB permission denied");
+                }
+
+                @Override
+                public void error(ErrorType errorType, Identity identity) {
+                    if (errorType == ErrorType.DEVICE_UNAVAILABLE_WHEN_ASKED_PERMISSION) {
+                        usbPermissionHandler.requestFlirOnePermisson(
+                                connectedIdentity, MainActivity.this, permissionListener);
+                    } else {
+                        showMessage.show("USB permission error: " + errorType);
+                    }
+                }
+            };
+
+    private final ConnectionStatusListener connectionStatusListener = errorCode -> {
+        Log.d(TAG, "Camera disconnected: " + errorCode);
+        runOnUiThread(() -> {
+            updateConnectionText(connectedIdentity, "DISCONNECTED");
+            connectedIdentity = null;
+        });
     };
 
-    /**
-     * Camera Discovery thermalImageStreamListener, is notified if a new camera was found during a active discovery phase
-     * <p>
-     * Note that callbacks are received on a non-ui thread so have to eg use {@link #runOnUiThread(Runnable)} to interact view UI components
-     */
+    private final CameraHandler.DiscoveryStatus discoveryStatusListener =
+            new CameraHandler.DiscoveryStatus() {
+                @Override
+                public void started() {
+                    discoveryStatus.setText(getString(R.string.connection_status_text, "discovering"));
+                }
+
+                @Override
+                public void stopped() {
+                    discoveryStatus.setText(getString(R.string.connection_status_text, "not discovering"));
+                }
+            };
+
     private final DiscoveryEventListener cameraDiscoveryListener = new DiscoveryEventListener() {
         @Override
         public void onCameraFound(DiscoveredCamera discoveredCamera) {
-            Log.d(TAG, "onCameraFound identity:" + discoveredCamera.getIdentity());
+            Log.d(TAG, "Camera found: " + discoveredCamera.getIdentity());
             runOnUiThread(() -> cameraHandler.add(discoveredCamera.getIdentity()));
         }
 
         @Override
-        public void onDiscoveryError(CommunicationInterface communicationInterface, ErrorCode errorCode) {
-            Log.d(TAG, "onDiscoveryError communicationInterface:" + communicationInterface + " errorCode:" + errorCode);
-
+        public void onDiscoveryError(CommunicationInterface commInterface, ErrorCode errorCode) {
+            Log.e(TAG, "Discovery error: " + commInterface + " - " + errorCode);
             runOnUiThread(() -> {
                 stopDiscovery();
-                MainActivity.this.showMessage.show("onDiscoveryError communicationInterface:" + communicationInterface + " errorCode:" + errorCode);
+                showMessage.show("Discovery error: " + errorCode);
             });
         }
     };
 
-    private final ShowMessage showMessage = message -> Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
+    private final ShowMessage showMessage = message ->
+            Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
+
+    private void updateConnectionText(Identity identity, String status) {
+        String deviceId = identity != null ? identity.deviceId : "";
+        connectionStatus.setText(getString(R.string.connection_status_text,
+                deviceId + " " + status));
+    }
 
     private void showSDKversion(String version) {
         TextView sdkVersionTextView = findViewById(R.id.sdk_version);
@@ -392,9 +614,11 @@ public class MainActivity extends AppCompatActivity {
         sdkVersionTextView.setText(sdkVersionText);
     }
 
-    private void showSDKCommitHash(String version) {
+    private void showSDKCommitHash(String commitHash) {
         TextView sdkVersionTextView = findViewById(R.id.sdk_commit_hash);
-        String sdkVersionText = getString(R.string.sdk_commit_hash_text, version).substring(0, 10); // 10 chars for SHA is enough
+        String truncated = commitHash.length() > 10 ?
+                commitHash.substring(0, 10) : commitHash;
+        String sdkVersionText = getString(R.string.sdk_commit_hash_text, truncated);
         sdkVersionTextView.setText(sdkVersionText);
     }
 
@@ -402,9 +626,11 @@ public class MainActivity extends AppCompatActivity {
         connectionStatus = findViewById(R.id.connection_status_text);
         discoveryStatus = findViewById(R.id.discovery_status);
         deviceInfo = findViewById(R.id.device_info_text);
-
         msxImage = findViewById(R.id.msx_image);
         photoImage = findViewById(R.id.photo_image);
     }
 
+    public interface ShowMessage {
+        void show(String message);
+    }
 }
