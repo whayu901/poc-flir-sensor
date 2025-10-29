@@ -394,73 +394,98 @@ public class MainActivity extends AppCompatActivity {
     /**
      * Update ROI temperature statistics
      */
-    private void updateRoiStats(TextView statsText, RectF roiInView, ImageView iv,
+    private void updateRoiStats(TextView statsText, RectF roiView, ImageView iv,
                                 Bitmap bmp, CameraHandler.TempFrameSnapshot snap) {
         try {
-            // Get displayed image rectangle
-            RectF imgRect = getDisplayedImageRect(iv);
-            if (!RectF.intersects(imgRect, roiInView)) return;
+            if (bmp == null || snap == null || snap.tempC == null) return;
 
-            // Clamp ROI to displayed image bounds
-            RectF clipped = new RectF(
-                    Math.max(roiInView.left, imgRect.left),
-                    Math.max(roiInView.top, imgRect.top),
-                    Math.min(roiInView.right, imgRect.right),
-                    Math.min(roiInView.bottom, imgRect.bottom)
-            );
+            // 1) Map the ROI corners from VIEW space -> BITMAP pixel space using the actual image matrix
+            //    (This is more precise than scaling via displayed rect.)
+            PointF tl = mapViewToBitmap(iv, roiView.left,  roiView.top,    bmp);
+            PointF tr = mapViewToBitmap(iv, roiView.right, roiView.top,    bmp);
+            PointF bl = mapViewToBitmap(iv, roiView.left,  roiView.bottom, bmp);
+            PointF br = mapViewToBitmap(iv, roiView.right, roiView.bottom, bmp);
 
-            // Scale factors from displayed image to bitmap
-            float scaleX = (float) bmp.getWidth() / imgRect.width();
-            float scaleY = (float) bmp.getHeight() / imgRect.height();
+            // Bounding box in bitmap space (handles any non-uniform scale)
+            float bx0f = Math.min(Math.min(tl.x, tr.x), Math.min(bl.x, br.x));
+            float by0f = Math.min(Math.min(tl.y, tr.y), Math.min(bl.y, br.y));
+            float bx1f = Math.max(Math.max(tl.x, tr.x), Math.max(bl.x, br.x));
+            float by1f = Math.max(Math.max(tl.y, tr.y), Math.max(bl.y, br.y));
 
-            // Map to bitmap coordinates
-            int bx0 = Math.round((clipped.left - imgRect.left) * scaleX);
-            int by0 = Math.round((clipped.top - imgRect.top) * scaleY);
-            int bx1 = Math.round((clipped.right - imgRect.left) * scaleX);
-            int by1 = Math.round((clipped.bottom - imgRect.top) * scaleY);
+            // Clamp to bitmap bounds
+            bx0f = Math.max(0, Math.min(bx0f, bmp.getWidth()  - 1));
+            by0f = Math.max(0, Math.min(by0f, bmp.getHeight() - 1));
+            bx1f = Math.max(0, Math.min(bx1f, bmp.getWidth()  - 1));
+            by1f = Math.max(0, Math.min(by1f, bmp.getHeight() - 1));
 
-            bx0 = clamp(bx0, 0, bmp.getWidth() - 1);
-            by0 = clamp(by0, 0, bmp.getHeight() - 1);
-            bx1 = clamp(bx1, 0, bmp.getWidth() - 1);
-            by1 = clamp(by1, 0, bmp.getHeight() - 1);
-
-            if (bx1 <= bx0 || by1 <= by0) return;
-
-            // Map to thermal grid coordinates
+            // 2) Map bitmap -> THERMAL grid (snap.w x snap.h)
             float gx = (float) snap.w / bmp.getWidth();
             float gy = (float) snap.h / bmp.getHeight();
+            float tx0f = bx0f * gx, ty0f = by0f * gy;
+            float tx1f = bx1f * gx, ty1f = by1f * gy;
 
-            int tx0 = clamp(Math.round(bx0 * gx), 0, snap.w - 1);
-            int ty0 = clamp(Math.round(by0 * gy), 0, snap.h - 1);
-            int tx1 = clamp(Math.round(bx1 * gx), 0, snap.w - 1);
-            int ty1 = clamp(Math.round(by1 * gy), 0, snap.h - 1);
+            // Convert to integer index range (half-open) and ensure at least 1 pixel
+            int tx0 = clamp((int) Math.floor(tx0f), 0, snap.w - 1);
+            int ty0 = clamp((int) Math.floor(ty0f), 0, snap.h - 1);
+            int tx1 = clamp((int) Math.ceil (tx1f), 1, snap.w);   // half-open end
+            int ty1 = clamp((int) Math.ceil (ty1f), 1, snap.h);   // half-open end
 
-            // Compute min/max temperature in ROI
-            float[] temps = snap.tempC;
-            double minC = Double.POSITIVE_INFINITY;
-            double maxC = Double.NEGATIVE_INFINITY;
+            // If the box is tiny and collapses to <1 thermal pixel, expand to a small 3×3 neighborhood
+            if (tx1 - tx0 < 1) { tx0 = clamp(tx0 - 1, 0, snap.w - 1); tx1 = clamp(tx0 + 2, 1, snap.w); }
+            if (ty1 - ty0 < 1) { ty0 = clamp(ty0 - 1, 0, snap.h - 1); ty1 = clamp(ty0 + 2, 1, snap.h); }
 
-            for (int y = ty0; y <= ty1; y++) {
-                int rowOffset = y * snap.w;
-                for (int x = tx0; x <= tx1; x++) {
-                    float temp = temps[rowOffset + x];
-                    if (temp < minC) minC = temp;
-                    if (temp > maxC) maxC = temp;
+            // 3) Scan the thermal snapshot in that ROI precisely
+            float[] t = snap.tempC;
+            double minC = Double.POSITIVE_INFINITY, maxC = Double.NEGATIVE_INFINITY;
+
+            for (int y = ty0; y < ty1; y++) {
+                int row = y * snap.w;
+                for (int x = tx0; x < tx1; x++) {
+                    float v = t[row + x];
+                    if (v < minC) minC = v;
+                    if (v > maxC) maxC = v;
                 }
             }
 
-            if (Double.isFinite(minC) && Double.isFinite(maxC)) {
-                statsText.setText(String.format(java.util.Locale.US,
-                        "High: %.1f°C   Low: %.1f°C", maxC, minC));
-            } else {
+            if (minC == Double.POSITIVE_INFINITY) {
                 statsText.setText("High: --°C   Low: --°C");
+            } else {
+                statsText.setText(String.format(java.util.Locale.US, "High: %.1f°C   Low: %.1f°C", maxC, minC));
             }
-
         } catch (Exception e) {
             Log.e(TAG, "ROI stats calculation error", e);
             statsText.setText("High: --°C   Low: --°C");
         }
     }
+
+    private PointF mapViewToBitmap(ImageView iv, float vx, float vy, Bitmap bmp) {
+        // Inverse of the actual image matrix gives true mapping (handles fitCenter, etc.)
+        android.graphics.Matrix inv = new android.graphics.Matrix();
+        android.graphics.Matrix m = new android.graphics.Matrix(iv.getImageMatrix());
+
+        // Account for ImageView's internal centering padding (same math your getDisplayedImageRect did)
+        RectF imgRectOnView = getDisplayedImageRect(iv);
+        float dx = (iv.getWidth() - imgRectOnView.width()) / 2f;
+        float dy = (iv.getHeight() - imgRectOnView.height()) / 2f;
+        m.postTranslate(-dx, -dy);
+
+        if (!m.invert(inv)) return new PointF(0, 0);
+
+        float[] pts = new float[] { vx, vy };
+        inv.mapPoints(pts);
+
+        // Clamp to bitmap
+        float x = Math.max(0, Math.min(pts[0], bmp.getWidth()  - 1));
+        float y = Math.max(0, Math.min(pts[1], bmp.getHeight() - 1));
+        return new PointF(x, y);
+    }
+
+    private static class PointF {
+        final float x, y;
+        PointF(float x, float y) { this.x = x; this.y = y; }
+    }
+
+
 
     // ==================== Helper Methods ====================
 
