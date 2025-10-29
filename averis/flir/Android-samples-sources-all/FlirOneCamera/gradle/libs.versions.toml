@@ -1,0 +1,66 @@
+# NOTE: In our Jenkins CI MastodonAndroid/gradle/libs.versions.toml file is copied to modules/gradle/libs.versions.toml
+# Thus if you need to build modules from command line you need to manually also copy the toml file allowing to Gradle to resolve dependencies correctly
+
+[versions]
+appcompat = "1.7.0"
+androidGradlePlugin = "8.8.0"
+kotlinGradlePlugin = "2.0.21"
+material = "1.12.0"
+gson = "2.10.1"
+apacheCommons = "3.12.0"
+jetbrainsAnnotations = "24.0.1"
+junit = "4.13.2"
+testRunner = "1.6.1"
+androidxTestRules = "1.6.1"
+testEspresso = "3.6.1"
+kotlinxCoroutines = "1.7.3"
+guava = "28.2-android"
+constraintlayout = "2.2.1"
+androidxCore = "1.16.0"
+androidxLifecycle = "2.9.0"
+androidxRecyclerview = "1.4.0"
+androidxLegacy = "1.0.0"
+androidxTestExtJunit = "1.2.1"
+appCenterSdkVersion = "5.0.0"
+mockitoCore = "3.0.0"
+monitor = "1.7.2"
+androidXmlRunListener = "0.3.1"
+orchestrator = "1.5.1"
+androidxAnnotation = "1.9.1"
+
+[libraries]
+androidx-appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appcompat" }
+android-material = { module = "com.google.android.material:material", version.ref = "material" }
+google-gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
+apache-commons = { module = "org.apache.commons:commons-lang3", version.ref = "apacheCommons" }
+gradle = { module = "com.android.tools.build:gradle", version.ref = "androidGradlePlugin" }
+jetbrains-annotations = { module = "org.jetbrains:annotations", version.ref = "jetbrainsAnnotations" }
+junit = { module = "junit:junit", version.ref = "junit" }
+androidx-test-runner = { module = "androidx.test:runner", version.ref = "testRunner" }
+androidx-test-espresso = { module = "androidx.test.espresso:espresso-core", version.ref = "testEspresso" }
+androidx-test-espresso-contrib = { module = "androidx.test.espresso:espresso-contrib", version.ref = "testEspresso" }
+kotlin-gradle-plugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlinGradlePlugin" }
+kotlinx-coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinxCoroutines" }
+google-guava = { module = "com.google.guava:guava", version.ref = "guava" }
+androidx-constraintlayout = { module = "androidx.constraintlayout:constraintlayout", version.ref = "constraintlayout" }
+androidx-core = { module = "androidx.core:core-ktx", version.ref = "androidxCore" }
+androidx-lifecycle-livedata = { module = "androidx.lifecycle:lifecycle-livedata-ktx", version.ref = "androidxLifecycle" }
+androidx-lifecycle-viewmodel = { module = "androidx.lifecycle:lifecycle-viewmodel-ktx", version.ref = "androidxLifecycle" }
+androidx-lifecycle-runtime = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "androidxLifecycle" }
+androidx-recyclerview = { module = "androidx.recyclerview:recyclerview", version.ref = "androidxRecyclerview" }
+androidx-legacy = { module = "androidx.legacy:legacy-support-v4", version.ref = "androidxLegacy" }
+androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "androidxTestExtJunit" }
+androidx-test-rules = { module = "androidx.test:rules", version.ref = "androidxTestRules" }
+microsoft-appcenter-analytics = { module = "com.microsoft.appcenter:appcenter-analytics", version.ref = "appCenterSdkVersion" }
+microsoft-appcenter-crashes = { module = "com.microsoft.appcenter:appcenter-crashes", version.ref = "appCenterSdkVersion" }
+mockito-android = { module = "org.mockito:mockito-android", version.ref = "mockitoCore" }
+mockito-core = { module = "org.mockito:mockito-core", version.ref = "mockitoCore" }
+android-xml-run-listener = { module = "de.schroepf:android-xml-run-listener", version.ref = "androidXmlRunListener" }
+androidx-orchestrator = { module = "androidx.test:orchestrator", version.ref = "orchestrator" }
+androidx-monitor = { module = "androidx.test:monitor", version.ref = "monitor" }
+androidx-annotation = { module = "androidx.annotation:annotation", version.ref = "androidxAnnotation" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "androidGradlePlugin" }
+android-library = { id = "com.android.library", version.ref = "androidGradlePlugin" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlinGradlePlugin" }
