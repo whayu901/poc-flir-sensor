@@ -10,6 +10,8 @@
  * ******************************************************************/
 package com.samples.flironecamera;
 
+import static com.samples.flironecamera.R.*;
+
 import android.graphics.Bitmap;
 import android.graphics.RectF;
 import android.os.Bundle;
@@ -22,6 +24,7 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -402,6 +405,9 @@ public class MainActivity extends AppCompatActivity {
         Button closeBtn = dialogView.findViewById(R.id.closeDialogBtn);
         FrameLayout container = dialogView.findViewById(R.id.previewContainer);
         Spinner modeSpinner = dialogView.findViewById(R.id.modeSpinner);
+        LinearLayout countRow = dialogView.findViewById(R.id.countRow);
+        Spinner countSpinner = dialogView.findViewById(R.id.countSpinner);
+
 
         imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
 
@@ -414,6 +420,12 @@ public class MainActivity extends AppCompatActivity {
         container.addView(selectionOverlay, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
+
+        // adapter for counts
+        ArrayAdapter<CharSequence> countAdapter = ArrayAdapter.createFromResource(
+                this, R.array.point_counts, android.R.layout.simple_spinner_dropdown_item);
+        countSpinner.setAdapter(countAdapter);
+        countSpinner.setSelection(0); // default "3"
 
         // adapter from resources
         ArrayAdapter<CharSequence> adapter = ArrayAdapter.createFromResource(
@@ -429,12 +441,33 @@ public class MainActivity extends AppCompatActivity {
                 if (pos == 0) { // Pointing (1 spot)
                     enableSinglePoint(container, statsText, imageView, bitmap, snap);
                 } else if (pos == 1) { // Pointing (3 spots)
-                    enableMultiPoint(container, statsText, imageView, bitmap, snap);
+                    countRow.setVisibility(View.VISIBLE);
+
+
+
+                    // current selection (3/5/10)
+                    int maxPoints = Integer.parseInt((String) countSpinner.getSelectedItem());
+                    enableMultiPoint(container, statsText, imageView, bitmap, snap, maxPoints);
                 } else { // Rectangle
                     enableRectangleMode(container, statsText, imageView, bitmap, snap);
                 }
             }
 
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+
+        countSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int i, long id) {
+                if (currentMode == MODE_POINT_MULTI) {
+                    int maxPoints = Integer.parseInt((String) countSpinner.getSelectedItem());
+                    // Update existing overlay in place (no recreation)
+                    if (multiPointOverlay != null) {
+                        multiPointOverlay.setMaxPoints(maxPoints);
+                        // If we increased the limit, auto-seed more points to reach new max
+                        enableMultiPoint(container, statsText, imageView, bitmap, snap, maxPoints);
+                    }
+                }
+            }
             @Override public void onNothingSelected(AdapterView<?> parent) {}
         });
 
@@ -580,32 +613,63 @@ public class MainActivity extends AppCompatActivity {
 
     private void enableMultiPoint(FrameLayout container, TextView statsText,
                                   ImageView iv, Bitmap bmp,
-                                  CameraHandler.TempFrameSnapshot snap) {
+                                  CameraHandler.TempFrameSnapshot snap,
+                                  int maxPoints) {
         currentMode = MODE_POINT_MULTI;
 
         clearOverlaysKeepImage(container);
 
-        // (optional) remove lingering selection overlay if it was still attached
+        // Remove single-spot overlay if still attached
         if (selectionOverlay != null && selectionOverlay.getParent() == container) {
             container.removeView(selectionOverlay);
         }
 
-        multiPointOverlay = new MultiPointOverlay(this);
-        container.addView(multiPointOverlay, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT));
-        multiPointOverlay.bringToFront();
+        if (multiPointOverlay == null) {
+            multiPointOverlay = new MultiPointOverlay(this);
+            container.addView(multiPointOverlay, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
+        } else if (multiPointOverlay.getParent() != container) {
+            container.addView(multiPointOverlay);
+        }
 
+        // Apply the requested max immediately
+        multiPointOverlay.setMaxPoints(maxPoints);
+
+        multiPointOverlay.bringToFront();
         multiPointOverlay.setOnPointsChangedListener(points ->
                 updateMultiPointTemps(statsText, points, iv, bmp, snap));
 
-        // Seed 3 points so user sees values immediately
+        // Auto-seed up to maxPoints so the UI shows the right count immediately
         iv.post(() -> {
             RectF img = getDisplayedImageRect(iv);
-            if (img.width() > 0 && img.height() > 0) {
-                multiPointOverlay.addPoint(img.centerX() - img.width() * 0.2f, img.centerY());
-                multiPointOverlay.addPoint(img.centerX(),                         img.centerY());
-                multiPointOverlay.addPoint(img.centerX() + img.width() * 0.2f, img.centerY());
+            if (img.width() <= 0 || img.height() <= 0) return;
+
+            int need = maxPoints - multiPointOverlay.getPointCount();
+            if (need <= 0) return;
+
+            float cx = img.centerX(), cy = img.centerY();
+            float span = img.width() * 0.28f;
+
+            // Always ensure at least one at center
+            if (multiPointOverlay.getPointCount() == 0) {
+                multiPointOverlay.addPoint(cx, cy);
+            }
+
+            // Add symmetric points left/right/up/down until reaching max
+            while (multiPointOverlay.getPointCount() < maxPoints) {
+                int n = multiPointOverlay.getPointCount();
+                switch (n) {
+                    case 1: multiPointOverlay.addPoint(cx - span, cy); break;
+                    case 2: multiPointOverlay.addPoint(cx + span, cy); break;
+                    case 3: multiPointOverlay.addPoint(cx, cy - span * 0.5f); break;
+                    case 4: multiPointOverlay.addPoint(cx, cy + span * 0.5f); break;
+                    case 5: multiPointOverlay.addPoint(cx - span * 0.5f, cy - span * 0.5f); break;
+                    case 6: multiPointOverlay.addPoint(cx + span * 0.5f, cy + span * 0.5f); break;
+                    case 7: multiPointOverlay.addPoint(cx - span * 0.5f, cy + span * 0.5f); break;
+                    case 8: multiPointOverlay.addPoint(cx + span * 0.5f, cy - span * 0.5f); break;
+                    default: multiPointOverlay.addPoint(cx, cy); break;
+                }
             }
         });
     }

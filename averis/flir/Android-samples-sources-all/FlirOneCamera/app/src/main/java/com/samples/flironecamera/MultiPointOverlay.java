@@ -40,8 +40,22 @@ public class MultiPointOverlay extends View {
         }
     }
 
+    private int maxPoints = 3; // default
+
+    public void setMaxPoints(int max) {
+        if (max < 1) max = 1;
+        this.maxPoints = max;
+        // Trim if over limit
+        while (points.size() > maxPoints) points.remove(points.size() - 1);
+        invalidate();
+        notifyChange();
+    }
+
+    public int getMaxPoints() { return maxPoints; }
+    public int getPointCount() { return points.size(); }
+
     public void addPoint(float x, float y) {
-        if (points.size() < 3) {
+        if (points.size() < maxPoints) {
             points.add(new PointData(x, y, points.size() + 1));
             invalidate();
             notifyChange();
