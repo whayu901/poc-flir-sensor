@@ -17,13 +17,17 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.View;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 
 import com.flir.thermalsdk.ErrorCode;
@@ -37,6 +41,7 @@ import com.flir.thermalsdk.live.discovery.DiscoveryEventListener;
 import com.flir.thermalsdk.log.ThermalLog;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -79,6 +84,10 @@ public class MainActivity extends AppCompatActivity {
     // UI Handler for throttled updates
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private final Runnable updateUIRunnable = this::updateUIWithLatestFrame;
+
+    private SelectionOverlay selectionOverlay;
+    private MultiPointOverlay multiPointOverlay;
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -139,6 +148,9 @@ public class MainActivity extends AppCompatActivity {
     public void performNuc(View view) {
         cameraHandler.performNuc();
     }
+
+
+
 
     /**
      * OPTIMIZED frame capture with thermal data snapshot
@@ -345,44 +357,98 @@ public class MainActivity extends AppCompatActivity {
 
 
     // ==================== Capture Preview Dialog ====================
+    private void updatePointRealtimeLabel(SelectionOverlay overlay, ImageView iv, Bitmap bmp) {
+        try {
+            // Map overlay center (view coords) -> bitmap coords
+            RectF b = overlay.getBounds();
+            float vx = b.centerX(), vy = b.centerY();
+
+            // Uses your existing helper; if you don’t have it yet, paste the one you used for ROI mapping
+            PointF bp = mapViewToBitmap(iv, vx, vy, bmp); // returns bitmap-space x/y (clamped)
+
+            // Map bitmap -> thermal grid using the *latest* live snapshot
+            CameraHandler.TempFrameSnapshot live = cameraHandler.getLastTempFrameSnapshot();
+            if (live == null || live.tempC == null) {
+                overlay.setTempLabel("-- °C");
+                return;
+            }
+
+            float gx = (float) live.w / bmp.getWidth();
+            float gy = (float) live.h / bmp.getHeight();
+            int tx = clamp(Math.round(bp.x * gx), 0, live.w - 1);
+            int ty = clamp(Math.round(bp.y * gy), 0, live.h - 1);
+
+            float center = live.tempC[ty * live.w + tx];
+
+            overlay.setTempLabel(String.format(java.util.Locale.US, "%.1f°C", center));
+        } catch (Exception e) {
+            Log.w(TAG, "updatePointRealtimeLabel failed", e);
+            overlay.setTempLabel("-- °C");
+        }
+    }
+
+
+    private static final int MODE_RECT = 1;
+    private static final int MODE_POINT = 2;
+    private static final int MODE_POINT_MULTI = 3;
+    private int currentMode = MODE_RECT;
 
     private void showCapturePopupWithRoi(@NonNull Bitmap bitmap, double minC, double maxC,
                                          @NonNull CameraHandler.TempFrameSnapshot snap) {
+
         View dialogView = getLayoutInflater().inflate(R.layout.dialog_captured_preview, null);
         ImageView imageView = dialogView.findViewById(R.id.capturedImageView);
         TextView statsText = dialogView.findViewById(R.id.tempStatsText);
         Button closeBtn = dialogView.findViewById(R.id.closeDialogBtn);
         FrameLayout container = dialogView.findViewById(R.id.previewContainer);
+        Spinner modeSpinner = dialogView.findViewById(R.id.modeSpinner);
+
+        imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
 
         imageView.setImageBitmap(bitmap);
+
         statsText.setText(String.format(java.util.Locale.US,
                 "High: %.1f°C   Low: %.1f°C", maxC, minC));
 
-        // Add selection overlay
-        SelectionOverlay overlay = new SelectionOverlay(this);
-        container.addView(overlay, new FrameLayout.LayoutParams(
+        selectionOverlay = new SelectionOverlay(this);
+        container.addView(selectionOverlay, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
-        // Initialize ROI to center 40% of displayed image
+        // adapter from resources
+        ArrayAdapter<CharSequence> adapter = ArrayAdapter.createFromResource(
+                this, R.array.modes_array, android.R.layout.simple_spinner_dropdown_item);
+        modeSpinner.setAdapter(adapter);
+
+// default selection (choose what you prefer)
+        modeSpinner.setSelection(2); // 0=single point, 1=multi point (3), 2=rectangle
+
+        modeSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                if (pos == 0) { // Pointing (1 spot)
+                    enableSinglePoint(container, statsText, imageView, bitmap, snap);
+                } else if (pos == 1) { // Pointing (3 spots)
+                    enableMultiPoint(container, statsText, imageView, bitmap, snap);
+                } else { // Rectangle
+                    enableRectangleMode(container, statsText, imageView, bitmap, snap);
+                }
+            }
+
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+
         imageView.post(() -> {
             RectF imgRect = getDisplayedImageRect(imageView);
             float w = imgRect.width() * 0.4f;
             float h = imgRect.height() * 0.4f;
             float left = imgRect.centerX() - w / 2f;
             float top = imgRect.centerY() - h / 2f;
-            overlay.setBounds(new RectF(left, top, left + w, top + h));
-
-            // Compute initial ROI stats
-            updateRoiStats(statsText, overlay.getBounds(), imageView, bitmap, snap);
+            selectionOverlay.setBounds(new RectF(left, top, left + w, top + h));
+            updateRoiStats(statsText, selectionOverlay.getBounds(), imageView, bitmap, snap);
         });
 
-        // Listen to ROI changes
-        overlay.setOnBoundsChangedListener(bounds ->
-                updateRoiStats(statsText, bounds, imageView, bitmap, snap));
-
-        // Create and show dialog
-        android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this)
+        AlertDialog dialog = new AlertDialog.Builder(this)
                 .setView(dialogView)
                 .setCancelable(true)
                 .create();
@@ -390,6 +456,7 @@ public class MainActivity extends AppCompatActivity {
         closeBtn.setOnClickListener(v -> dialog.dismiss());
         dialog.show();
     }
+
 
     /**
      * Update ROI temperature statistics
@@ -457,6 +524,233 @@ public class MainActivity extends AppCompatActivity {
             statsText.setText("High: --°C   Low: --°C");
         }
     }
+
+    private void clearOverlaysKeepImage(FrameLayout container) {
+        for (int i = container.getChildCount() - 1; i >= 0; i--) {
+            View v = container.getChildAt(i);
+            if (v.getId() != R.id.capturedImageView) {
+                container.removeViewAt(i);
+            }
+        }
+    }
+
+
+    private void enableSinglePoint(FrameLayout container, TextView statsText,
+                                   ImageView iv, Bitmap bmp,
+                                   CameraHandler.TempFrameSnapshot snap) {
+        currentMode = MODE_POINT;
+
+        // Remove all overlays except the ImageView
+        clearOverlaysKeepImage(container);
+
+        // Ensure we have the selection overlay in the container
+        if (selectionOverlay == null) {
+            selectionOverlay = new SelectionOverlay(this);
+        }
+        if (selectionOverlay.getParent() == null) {
+            container.addView(selectionOverlay, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
+        }
+
+        selectionOverlay.setMode(SelectionOverlay.MODE_POINT);
+        selectionOverlay.setOnBoundsChangedListener(null); // not used in point mode
+
+        // Make crosshair tiny so its center can reach whole image
+        iv.post(() -> {
+            RectF img = getDisplayedImageRect(iv);
+            float cx = img.centerX(), cy = img.centerY();
+            float half = 10f; // 20x20
+            selectionOverlay.setBounds(new RectF(cx - half, cy - half, cx + half, cy + half));
+
+            // Initial temp read
+            updatePointTemp(statsText, cx, cy, iv, bmp, snap);
+        });
+
+        // Live drag → update temp
+        selectionOverlay.setOnPointChangedListener((cx, cy) ->
+                updatePointTemp(statsText, cx, cy, iv, bmp, snap));
+
+        // Make sure it’s on top and receives touch
+        selectionOverlay.setClickable(true);
+        selectionOverlay.bringToFront();
+        container.invalidate();
+    }
+
+
+    private void enableMultiPoint(FrameLayout container, TextView statsText,
+                                  ImageView iv, Bitmap bmp,
+                                  CameraHandler.TempFrameSnapshot snap) {
+        currentMode = MODE_POINT_MULTI;
+
+        clearOverlaysKeepImage(container);
+
+        // (optional) remove lingering selection overlay if it was still attached
+        if (selectionOverlay != null && selectionOverlay.getParent() == container) {
+            container.removeView(selectionOverlay);
+        }
+
+        multiPointOverlay = new MultiPointOverlay(this);
+        container.addView(multiPointOverlay, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        multiPointOverlay.bringToFront();
+
+        multiPointOverlay.setOnPointsChangedListener(points ->
+                updateMultiPointTemps(statsText, points, iv, bmp, snap));
+
+        // Seed 3 points so user sees values immediately
+        iv.post(() -> {
+            RectF img = getDisplayedImageRect(iv);
+            if (img.width() > 0 && img.height() > 0) {
+                multiPointOverlay.addPoint(img.centerX() - img.width() * 0.2f, img.centerY());
+                multiPointOverlay.addPoint(img.centerX(),                         img.centerY());
+                multiPointOverlay.addPoint(img.centerX() + img.width() * 0.2f, img.centerY());
+            }
+        });
+    }
+
+
+
+    private void enableRectangleMode(FrameLayout container, TextView statsText,
+                                     ImageView iv, Bitmap bmp,
+                                     CameraHandler.TempFrameSnapshot snap) {
+        currentMode = MODE_RECT;
+
+        clearOverlaysKeepImage(container);
+
+        // Remove multi overlay if present
+        if (multiPointOverlay != null && multiPointOverlay.getParent() == container) {
+            container.removeView(multiPointOverlay);
+        }
+
+        if (selectionOverlay == null) {
+            selectionOverlay = new SelectionOverlay(this);
+        }
+        if (selectionOverlay.getParent() == null) {
+            container.addView(selectionOverlay, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
+        }
+
+        selectionOverlay.setMode(SelectionOverlay.MODE_RECT);
+        selectionOverlay.setOnPointChangedListener(null);
+        selectionOverlay.setOnBoundsChangedListener(bounds ->
+                updateRoiStats(statsText, bounds, iv, bmp, snap));
+
+        selectionOverlay.bringToFront();
+
+        // Optional: recompute once
+        selectionOverlay.post(() ->
+                updateRoiStats(statsText, selectionOverlay.getBounds(), iv, bmp, snap));
+    }
+
+
+
+
+    private void updatePointTemp(TextView statsText, float cx, float cy,
+                                 ImageView iv, Bitmap bmp,
+                                 CameraHandler.TempFrameSnapshot snap) {
+        try {
+            // View → displayed image rect
+            RectF imgRect = getDisplayedImageRect(iv);
+            if (imgRect.width() <= 1f || imgRect.height() <= 1f) {
+                statsText.setText("Temp: --°C");
+                return;
+            }
+
+            // Clamp crosshair to image area (so it works fully to the edges)
+            float px = Math.max(imgRect.left, Math.min(cx, imgRect.right));
+            float py = Math.max(imgRect.top,  Math.min(cy, imgRect.bottom));
+
+            // View → bitmap coords
+            float scaleX = (float) bmp.getWidth()  / imgRect.width();
+            float scaleY = (float) bmp.getHeight() / imgRect.height();
+            float bx = (px - imgRect.left) * scaleX;
+            float by = (py - imgRect.top)  * scaleY;
+
+            // Bitmap → thermal grid (continuous coords for bilinear)
+            float gx = (float) snap.w / bmp.getWidth();
+            float gy = (float) snap.h / bmp.getHeight();
+            float txf = bx * gx;
+            float tyf = by * gy;
+
+            // Bilinear sampling on thermal grid
+            int x0 = clamp((int) Math.floor(txf), 0, snap.w - 1);
+            int y0 = clamp((int) Math.floor(tyf), 0, snap.h - 1);
+            int x1 = clamp(x0 + 1, 0, snap.w - 1);
+            int y1 = clamp(y0 + 1, 0, snap.h - 1);
+
+            float wx = txf - x0;
+            float wy = tyf - y0;
+
+            float[] t = snap.tempC;
+            float t00 = t[y0 * snap.w + x0];
+            float t10 = t[y0 * snap.w + x1];
+            float t01 = t[y1 * snap.w + x0];
+            float t11 = t[y1 * snap.w + x1];
+
+            // bilinear interpolation
+            float top = t00 * (1 - wx) + t10 * wx;
+            float bot = t01 * (1 - wx) + t11 * wx;
+            float temp = top * (1 - wy) + bot * wy;
+
+            // (Optional) micro-average around the point for stability
+            // temp = smooth3x3(snap, txf, tyf); // skip if not needed
+
+            statsText.setText(String.format(java.util.Locale.US, "Temp: %.1f°C", temp));
+
+        } catch (Exception e) {
+            Log.w(TAG, "updatePointTemp failed", e);
+            statsText.setText("Temp: --°C");
+        }
+    }
+
+    private void updateMultiPointTemps(TextView statsText, ArrayList<MultiPointOverlay.PointData> pts,
+                                       ImageView iv, Bitmap bmp,
+                                       CameraHandler.TempFrameSnapshot snap) {
+
+        StringBuilder sb = new StringBuilder();
+
+        for (MultiPointOverlay.PointData p : pts) {
+            double t = getPointTemp(iv, bmp, snap, p.x, p.y);
+            p.temp = t;
+            sb.append(String.format(java.util.Locale.US,
+                    "Point %d: %.1f°C\n", p.index, t));
+        }
+
+        statsText.setText(sb.toString().trim());
+    }
+
+    private double getPointTemp(ImageView iv, Bitmap bmp,
+                                CameraHandler.TempFrameSnapshot snap,
+                                float cx, float cy) {
+
+        RectF imgRect = getDisplayedImageRect(iv);
+
+        float px = Math.max(imgRect.left, Math.min(cx, imgRect.right));
+        float py = Math.max(imgRect.top,  Math.min(cy, imgRect.bottom));
+
+        float scaleX = (float) bmp.getWidth() / imgRect.width();
+        float scaleY = (float) bmp.getHeight() / imgRect.height();
+
+        float bx = (px - imgRect.left) * scaleX;
+        float by = (py - imgRect.top)  * scaleY;
+
+        float gx = (float) snap.w / bmp.getWidth();
+        float gy = (float) snap.h / bmp.getHeight();
+
+        float txf = bx * gx;
+        float tyf = by * gy;
+
+        int x0 = clamp((int) txf, 0, snap.w - 1);
+        int y0 = clamp((int) tyf, 0, snap.h - 1);
+
+        return snap.tempC[y0 * snap.w + x0];
+    }
+
+
+
 
     private PointF mapViewToBitmap(ImageView iv, float vx, float vy, Bitmap bmp) {
         // Inverse of the actual image matrix gives true mapping (handles fitCenter, etc.)

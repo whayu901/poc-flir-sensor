@@ -10,84 +10,141 @@ import android.view.ScaleGestureDetector;
 import android.view.View;
 
 /**
- * Enhanced SelectionOverlay with:
- * - Single touch: Move and resize rectangle
- * - Two-finger pinch: Scale rectangle size
- * - Visual feedback for better UX
- * - Temperature display integration
+ * SelectionOverlay with two modes:
+ *  - MODE_RECT: draggable/resizable rectangle (pinch-zoom supported)
+ *  - MODE_POINT: draggable crosshair with floating temperature label above
  */
 public class SelectionOverlay extends View {
 
-    // Paint objects
+    // ===== Public modes =====
+    public static final int MODE_RECT  = 0;
+    public static final int MODE_POINT = 1;
+
+    private int currentUiMode = MODE_RECT;
+
+
+    // ===== Paint objects =====
     private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint shadePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint shadePaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint handlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint textPaint   = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint crosshairPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-    // Constants
-    private static final float EDGE_TOUCH_THRESHOLD = 48f; // Larger touch target
+    // ===== Constants =====
+    private static final float EDGE_TOUCH_THRESHOLD = 48f; // touch target
     private static final float HANDLE_RADIUS = 12f;
     private static final float MIN_SIZE = 50f;
     private static final float BORDER_WIDTH = 3f;
-    private static final float TEXT_SIZE = 14f;
+    private static final float TEXT_SIZE_SP = 14f;
 
-    // Selection bounds
+    // ===== Rectangle bounds (also used to store point center) =====
     private RectF bounds = new RectF(100, 100, 300, 250);
 
-    // Interaction state
+    // ===== Interaction state (rectangle mode) =====
     private enum Mode {
         NONE, MOVE,
         RESIZE_L, RESIZE_T, RESIZE_R, RESIZE_B,
         RESIZE_LT, RESIZE_RT, RESIZE_LB, RESIZE_RB,
         PINCH_ZOOM
     }
-    private Mode currentMode = Mode.NONE;
+    private Mode currentDragMode = Mode.NONE;
     private float lastX, lastY;
 
-    // Multi-touch support
+    // ===== Pinch zoom (rectangle mode only) =====
     private ScaleGestureDetector scaleDetector;
     private float initialBoundsWidth, initialBoundsHeight;
     private float boundsCenterX, boundsCenterY;
 
-    // Visual feedback
+    // ===== Visual flags =====
     private boolean showHandles = true;
-    private boolean showCrosshair = false;
+    private boolean showCrosshairDuringPinch = false;
 
-    // Callback
-    public interface OnBoundsChangedListener {
-        void onChanged(RectF bounds);
-    }
-    private OnBoundsChangedListener listener;
+    // ===== Pointing mode label =====
+    private String tempLabel = "-- °C";
+
+    // ===== Callbacks =====
+    public interface OnBoundsChangedListener { void onChanged(RectF bounds); }
+    private OnBoundsChangedListener boundsListener;
+
+    public interface OnPointChangedListener { void onChanged(float cx, float cy); }
+    private OnPointChangedListener pointListener;
 
     public SelectionOverlay(Context context) {
         super(context);
         initPaints();
         initScaleDetector(context);
+        setLayerType(View.LAYER_TYPE_HARDWARE, null);
     }
 
+    // ---------- Public API ----------
+    public void setMode(int mode) {
+        this.currentUiMode = mode;
+        // Reset some visuals for clarity
+        showHandles = (mode == MODE_RECT);
+        showCrosshairDuringPinch = false;
+        invalidate();
+        // Notify once so external code can refresh stats immediately
+        if (mode == MODE_POINT && pointListener != null) {
+            pointListener.onChanged(bounds.centerX(), bounds.centerY());
+        } else if (mode == MODE_RECT && boundsListener != null) {
+            boundsListener.onChanged(getBounds());
+        }
+    }
+
+    public int getMode() {
+        return currentUiMode;
+    }
+
+    /** Real-time text to draw above crosshair in MODE_POINT (e.g. "36.7°C") */
+    public void setTempLabel(String text) {
+        this.tempLabel = text;
+        invalidate();
+    }
+
+    public void setOnBoundsChangedListener(OnBoundsChangedListener l) { this.boundsListener = l; }
+    public void setOnPointChangedListener(OnPointChangedListener l)   { this.pointListener  = l; }
+
+    public RectF getBounds() { return new RectF(bounds); }
+
+    /** Sets rectangle or point center (if MODE_POINT, only center matters) */
+    public void setBounds(RectF newBounds) {
+        bounds.set(newBounds);
+        constrainToView();
+        invalidate();
+        if (currentUiMode == MODE_POINT) {
+            if (pointListener != null) pointListener.onChanged(bounds.centerX(), bounds.centerY());
+        } else {
+            notifyBoundsListener();
+        }
+    }
+
+
+
+
+    // ---------- Init ----------
     private void initPaints() {
-        // Border paint (solid white)
+        // Border (white)
         borderPaint.setStyle(Paint.Style.STROKE);
         borderPaint.setStrokeWidth(BORDER_WIDTH);
         borderPaint.setColor(0xFFFFFFFF);
 
-        // Shade paint (semi-transparent white)
+        // Shade (semi-transparent)
         shadePaint.setColor(0x33FFFFFF);
         shadePaint.setStyle(Paint.Style.FILL);
 
-        // Handle paint (solid white circles)
+        // Handle circles
         handlePaint.setStyle(Paint.Style.FILL);
         handlePaint.setColor(0xFFFFFFFF);
         handlePaint.setShadowLayer(4f, 0f, 2f, 0x80000000);
 
-        // Text paint (white with shadow)
+        // Text (white with shadow)
+        float scaled = TEXT_SIZE_SP * getResources().getDisplayMetrics().scaledDensity;
         textPaint.setColor(0xFFFFFFFF);
-        textPaint.setTextSize(TEXT_SIZE * getResources().getDisplayMetrics().density);
+        textPaint.setTextSize(scaled);
         textPaint.setTextAlign(Paint.Align.CENTER);
         textPaint.setShadowLayer(3f, 0f, 1f, 0xFF000000);
 
-        // Crosshair paint (dashed lines)
+        // Crosshair (dashed)
         crosshairPaint.setStyle(Paint.Style.STROKE);
         crosshairPaint.setStrokeWidth(1.5f);
         crosshairPaint.setColor(0xAAFFFFFF);
@@ -98,312 +155,238 @@ public class SelectionOverlay extends View {
         scaleDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
             public boolean onScaleBegin(ScaleGestureDetector detector) {
-                currentMode = Mode.PINCH_ZOOM;
-                initialBoundsWidth = bounds.width();
+                if (currentUiMode != MODE_RECT) return false;
+                currentDragMode = Mode.PINCH_ZOOM;
+                initialBoundsWidth  = bounds.width();
                 initialBoundsHeight = bounds.height();
                 boundsCenterX = bounds.centerX();
                 boundsCenterY = bounds.centerY();
                 showHandles = false;
-                showCrosshair = true;
+                showCrosshairDuringPinch = true;
+                invalidate();
                 return true;
             }
 
             @Override
             public boolean onScale(ScaleGestureDetector detector) {
+                if (currentUiMode != MODE_RECT) return false;
                 float scaleFactor = detector.getScaleFactor();
 
-                // Calculate new size
-                float newWidth = initialBoundsWidth * scaleFactor;
-                float newHeight = initialBoundsHeight * scaleFactor;
+                float newW = Math.max(MIN_SIZE, initialBoundsWidth  * scaleFactor);
+                float newH = Math.max(MIN_SIZE, initialBoundsHeight * scaleFactor);
 
-                // Apply minimum size constraint
-                newWidth = Math.max(newWidth, MIN_SIZE);
-                newHeight = Math.max(newHeight, MIN_SIZE);
+                // Max size ~80% of view
+                float maxW = getWidth()  * 0.8f;
+                float maxH = getHeight() * 0.8f;
+                newW = Math.min(newW, maxW);
+                newH = Math.min(newH, maxH);
 
-                // Apply maximum size constraint (80% of view)
-                float maxWidth = getWidth() * 0.8f;
-                float maxHeight = getHeight() * 0.8f;
-                newWidth = Math.min(newWidth, maxWidth);
-                newHeight = Math.min(newHeight, maxHeight);
-
-                // Update bounds centered on original center
-                bounds.set(
-                        boundsCenterX - newWidth / 2f,
-                        boundsCenterY - newHeight / 2f,
-                        boundsCenterX + newWidth / 2f,
-                        boundsCenterY + newHeight / 2f
-                );
-
-                // Keep within view bounds
+                bounds.set(boundsCenterX - newW/2f, boundsCenterY - newH/2f,
+                        boundsCenterX + newW/2f, boundsCenterY + newH/2f);
                 constrainToView();
-
                 invalidate();
-                notifyListener();
+                notifyBoundsListener();
                 return true;
             }
 
             @Override
             public void onScaleEnd(ScaleGestureDetector detector) {
+                if (currentUiMode != MODE_RECT) return;
                 showHandles = true;
-                showCrosshair = false;
+                showCrosshairDuringPinch = false;
+                currentDragMode = Mode.NONE;
                 invalidate();
             }
         });
     }
 
-    // Public API
-    public void setOnBoundsChangedListener(OnBoundsChangedListener listener) {
-        this.listener = listener;
-    }
-
-    public RectF getBounds() {
-        return new RectF(bounds);
-    }
-
-    public void setBounds(RectF newBounds) {
-        bounds.set(newBounds);
-        constrainToView();
-        invalidate();
-        notifyListener();
-    }
-
+    // ---------- Drawing ----------
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
 
-        // Draw semi-transparent overlay inside selection
-        canvas.drawRect(bounds, shadePaint);
+        if (currentUiMode == MODE_RECT) {
+            // Rectangle mode visuals
+            canvas.drawRect(bounds, shadePaint);
+            canvas.drawRect(bounds, borderPaint);
 
-        // Draw border rectangle
-        canvas.drawRect(bounds, borderPaint);
+            if (showCrosshairDuringPinch) {
+                float cx = bounds.centerX(), cy = bounds.centerY();
+                canvas.drawLine(cx - 20, cy, cx + 20, cy, crosshairPaint);
+                canvas.drawLine(cx, cy - 20, cx, cy + 20, crosshairPaint);
+            }
 
-        // Draw crosshair at center (during pinch zoom)
-        if (showCrosshair) {
-            float cx = bounds.centerX();
-            float cy = bounds.centerY();
-            canvas.drawLine(cx - 20, cy, cx + 20, cy, crosshairPaint);
-            canvas.drawLine(cx, cy - 20, cx, cy + 20, crosshairPaint);
+            if (showHandles) {
+                drawHandle(canvas, bounds.left,  bounds.top);
+                drawHandle(canvas, bounds.right, bounds.top);
+                drawHandle(canvas, bounds.left,  bounds.bottom);
+                drawHandle(canvas, bounds.right, bounds.bottom);
+                drawHandle(canvas, bounds.centerX(), bounds.top);
+                drawHandle(canvas, bounds.centerX(), bounds.bottom);
+                drawHandle(canvas, bounds.left,  bounds.centerY());
+                drawHandle(canvas, bounds.right, bounds.centerY());
+            }
+
+            // Size label
+            String sizeLabel = String.format("%.0f × %.0f", bounds.width(), bounds.height());
+            float labelY = bounds.top - 10f;
+            if (labelY < textPaint.getTextSize()) {
+                labelY = bounds.bottom + textPaint.getTextSize() + 5f;
+            }
+//            canvas.drawText(sizeLabel, bounds.centerX(), labelY, textPaint);
+
+        } else {
+            // Pointing mode visuals
+            float cx = bounds.centerX(), cy = bounds.centerY();
+
+            // Crosshair
+            canvas.drawLine(cx - 30, cy, cx + 30, cy, borderPaint);
+            canvas.drawLine(cx, cy - 30, cx, cy + 30, borderPaint);
+
+            // Floating temperature label above crosshair (if provided)
+//            if (tempLabel != null) {
+//                canvas.drawText(tempLabel, cx, cy - 40, textPaint);
+//            }
         }
-
-        // Draw corner/edge handles
-        if (showHandles) {
-            drawHandle(canvas, bounds.left, bounds.top);           // Top-left
-            drawHandle(canvas, bounds.right, bounds.top);          // Top-right
-            drawHandle(canvas, bounds.left, bounds.bottom);        // Bottom-left
-            drawHandle(canvas, bounds.right, bounds.bottom);       // Bottom-right
-            drawHandle(canvas, bounds.centerX(), bounds.top);      // Top-center
-            drawHandle(canvas, bounds.centerX(), bounds.bottom);   // Bottom-center
-            drawHandle(canvas, bounds.left, bounds.centerY());     // Left-center
-            drawHandle(canvas, bounds.right, bounds.centerY());    // Right-center
-        }
-
-        // Draw size label
-        String sizeLabel = String.format("%.0f × %.0f", bounds.width(), bounds.height());
-        float labelY = bounds.top - 10f;
-        if (labelY < textPaint.getTextSize()) {
-            labelY = bounds.bottom + textPaint.getTextSize() + 5f;
-        }
-        canvas.drawText(sizeLabel, bounds.centerX(), labelY, textPaint);
     }
 
     private void drawHandle(Canvas canvas, float x, float y) {
         canvas.drawCircle(x, y, HANDLE_RADIUS, handlePaint);
     }
 
+    // ---------- Touch handling ----------
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        // Let scale detector handle multi-touch first
-        boolean scaledHandled = scaleDetector.onTouchEvent(event);
-
-        // If scale detector is active, don't process other gestures
-        if (currentMode == Mode.PINCH_ZOOM) {
-            if (event.getActionMasked() == MotionEvent.ACTION_UP ||
-                    event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
-                currentMode = Mode.NONE;
+        // Pointing mode: simple drag center; ignore pinch/resize
+        if (currentUiMode == MODE_POINT) {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    lastX = event.getX();
+                    lastY = event.getY();
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    float dx = event.getX() - lastX;
+                    float dy = event.getY() - lastY;
+                    bounds.offset(dx, dy);
+                    constrainToView();
+                    lastX = event.getX();
+                    lastY = event.getY();
+                    if (pointListener != null) pointListener.onChanged(bounds.centerX(), bounds.centerY());
+                    invalidate();
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    return true;
             }
             return true;
         }
 
-        // Handle single-touch gestures
-        float x = event.getX();
-        float y = event.getY();
+        // Rectangle mode: allow pinch + drag/resize
+        boolean scaled = scaleDetector.onTouchEvent(event);
+        if (currentDragMode == Mode.PINCH_ZOOM) {
+            if (event.getActionMasked() == MotionEvent.ACTION_UP ||
+                    event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+                currentDragMode = Mode.NONE;
+            }
+            return true;
+        }
 
+        float x = event.getX(), y = event.getY();
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                currentMode = hitTest(x, y);
-                lastX = x;
-                lastY = y;
+                currentDragMode = hitTest(x, y);
+                lastX = x; lastY = y;
                 showHandles = true;
                 invalidate();
                 return true;
 
             case MotionEvent.ACTION_MOVE:
-                if (currentMode != Mode.NONE) {
-                    float dx = x - lastX;
-                    float dy = y - lastY;
+                if (currentDragMode != Mode.NONE) {
+                    float dx = x - lastX, dy = y - lastY;
                     applyDrag(dx, dy);
-                    lastX = x;
-                    lastY = y;
+                    lastX = x; lastY = y;
                     invalidate();
-                    notifyListener();
+                    notifyBoundsListener();
                     return true;
                 }
                 break;
 
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
-                currentMode = Mode.NONE;
+                currentDragMode = Mode.NONE;
                 showHandles = true;
                 invalidate();
                 return true;
         }
 
-        return scaledHandled || super.onTouchEvent(event);
+        return scaled || super.onTouchEvent(event);
     }
 
-    /**
-     * Determine what part of the rectangle was touched
-     */
     private Mode hitTest(float x, float y) {
-        boolean nearLeft = Math.abs(x - bounds.left) <= EDGE_TOUCH_THRESHOLD;
-        boolean nearRight = Math.abs(x - bounds.right) <= EDGE_TOUCH_THRESHOLD;
-        boolean nearTop = Math.abs(y - bounds.top) <= EDGE_TOUCH_THRESHOLD;
-        boolean nearBottom = Math.abs(y - bounds.bottom) <= EDGE_TOUCH_THRESHOLD;
+        boolean L = Math.abs(x - bounds.left)   <= EDGE_TOUCH_THRESHOLD;
+        boolean R = Math.abs(x - bounds.right)  <= EDGE_TOUCH_THRESHOLD;
+        boolean T = Math.abs(y - bounds.top)    <= EDGE_TOUCH_THRESHOLD;
+        boolean B = Math.abs(y - bounds.bottom) <= EDGE_TOUCH_THRESHOLD;
 
-        // Check corners first (higher priority)
-        if (nearLeft && nearTop) return Mode.RESIZE_LT;
-        if (nearRight && nearTop) return Mode.RESIZE_RT;
-        if (nearLeft && nearBottom) return Mode.RESIZE_LB;
-        if (nearRight && nearBottom) return Mode.RESIZE_RB;
+        if (L && T) return Mode.RESIZE_LT;
+        if (R && T) return Mode.RESIZE_RT;
+        if (L && B) return Mode.RESIZE_LB;
+        if (R && B) return Mode.RESIZE_RB;
 
-        // Check edges
-        if (nearLeft) return Mode.RESIZE_L;
-        if (nearRight) return Mode.RESIZE_R;
-        if (nearTop) return Mode.RESIZE_T;
-        if (nearBottom) return Mode.RESIZE_B;
+        if (L) return Mode.RESIZE_L;
+        if (R) return Mode.RESIZE_R;
+        if (T) return Mode.RESIZE_T;
+        if (B) return Mode.RESIZE_B;
 
-        // Check if inside rectangle (move mode)
         if (bounds.contains(x, y)) return Mode.MOVE;
-
         return Mode.NONE;
     }
 
-    /**
-     * Apply drag transformation based on current mode
-     */
     private void applyDrag(float dx, float dy) {
-        switch (currentMode) {
-            case MOVE:
-                bounds.offset(dx, dy);
-                break;
-            case RESIZE_L:
-                bounds.left += dx;
-                break;
-            case RESIZE_R:
-                bounds.right += dx;
-                break;
-            case RESIZE_T:
-                bounds.top += dy;
-                break;
-            case RESIZE_B:
-                bounds.bottom += dy;
-                break;
-            case RESIZE_LT:
-                bounds.left += dx;
-                bounds.top += dy;
-                break;
-            case RESIZE_RT:
-                bounds.right += dx;
-                bounds.top += dy;
-                break;
-            case RESIZE_LB:
-                bounds.left += dx;
-                bounds.bottom += dy;
-                break;
-            case RESIZE_RB:
-                bounds.right += dx;
-                bounds.bottom += dy;
-                break;
-            default:
-                return;
+        switch (currentDragMode) {
+            case MOVE:       bounds.offset(dx, dy); break;
+            case RESIZE_L:   bounds.left   += dx;   break;
+            case RESIZE_R:   bounds.right  += dx;   break;
+            case RESIZE_T:   bounds.top    += dy;   break;
+            case RESIZE_B:   bounds.bottom += dy;   break;
+            case RESIZE_LT:  bounds.left   += dx; bounds.top    += dy; break;
+            case RESIZE_RT:  bounds.right  += dx; bounds.top    += dy; break;
+            case RESIZE_LB:  bounds.left   += dx; bounds.bottom += dy; break;
+            case RESIZE_RB:  bounds.right  += dx; bounds.bottom += dy; break;
+            default: break;
         }
 
-        // Apply minimum size constraint
+        // Min size
         if (bounds.width() < MIN_SIZE) {
-            if (currentMode == Mode.RESIZE_L || currentMode == Mode.RESIZE_LT || currentMode == Mode.RESIZE_LB) {
+            if (currentDragMode == Mode.RESIZE_L || currentDragMode == Mode.RESIZE_LT || currentDragMode == Mode.RESIZE_LB)
                 bounds.left = bounds.right - MIN_SIZE;
-            } else {
+            else
                 bounds.right = bounds.left + MIN_SIZE;
-            }
         }
-
         if (bounds.height() < MIN_SIZE) {
-            if (currentMode == Mode.RESIZE_T || currentMode == Mode.RESIZE_LT || currentMode == Mode.RESIZE_RT) {
+            if (currentDragMode == Mode.RESIZE_T || currentDragMode == Mode.RESIZE_LT || currentDragMode == Mode.RESIZE_RT)
                 bounds.top = bounds.bottom - MIN_SIZE;
-            } else {
+            else
                 bounds.bottom = bounds.top + MIN_SIZE;
-            }
         }
 
-        // Keep within view bounds
         constrainToView();
     }
 
-    /**
-     * Ensure rectangle stays within view bounds
-     */
     private void constrainToView() {
-        float viewWidth = getWidth();
-        float viewHeight = getHeight();
+        float vw = getWidth(), vh = getHeight();
+        if (vw <= 0 || vh <= 0) return;
 
-        if (viewWidth == 0 || viewHeight == 0) return;
+        if (bounds.left < 0)          bounds.offset(-bounds.left, 0);
+        if (bounds.top  < 0)          bounds.offset(0, -bounds.top);
+        if (bounds.right  > vw)       bounds.offset(vw - bounds.right, 0);
+        if (bounds.bottom > vh)       bounds.offset(0, vh - bounds.bottom);
 
-        // Constrain to view bounds
-        if (bounds.left < 0) {
-            float shift = -bounds.left;
-            bounds.offset(shift, 0);
-        }
-
-        if (bounds.top < 0) {
-            float shift = -bounds.top;
-            bounds.offset(0, shift);
-        }
-
-        if (bounds.right > viewWidth) {
-            float shift = bounds.right - viewWidth;
-            bounds.offset(-shift, 0);
-        }
-
-        if (bounds.bottom > viewHeight) {
-            float shift = bounds.bottom - viewHeight;
-            bounds.offset(0, -shift);
-        }
-
-        // If rectangle is larger than view (shouldn't happen, but just in case)
-        if (bounds.width() > viewWidth) {
-            bounds.right = bounds.left + viewWidth;
-        }
-
-        if (bounds.height() > viewHeight) {
-            bounds.bottom = bounds.top + viewHeight;
-        }
+        if (bounds.width()  > vw) { bounds.right = bounds.left + vw; }
+        if (bounds.height() > vh) { bounds.bottom = bounds.top + vh; }
     }
 
-    /**
-     * Notify listener of bounds change
-     */
-    private void notifyListener() {
-        if (listener != null) {
-            listener.onChanged(getBounds());
-        }
-    }
-
-    /**
-     * Enable/disable hardware acceleration layer for smoother performance
-     */
-    @Override
-    protected void onAttachedToWindow() {
-        super.onAttachedToWindow();
-        setLayerType(View.LAYER_TYPE_HARDWARE, null);
+    private void notifyBoundsListener() {
+        if (boundsListener != null) boundsListener.onChanged(getBounds());
     }
 }
