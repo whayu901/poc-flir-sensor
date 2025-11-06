@@ -116,10 +116,13 @@ class CameraHandler {
         void stopped();
     }
 
+
+
     public CameraHandler() {
         Log.d(TAG, "CameraHandler initialized");
         initProcessingThread();
     }
+
 
     private void initProcessingThread() {
         processingThread = new HandlerThread("ThermalProcessing");

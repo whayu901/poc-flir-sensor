@@ -712,63 +712,114 @@ public class MainActivity extends AppCompatActivity {
 
 
 
+//    private void updatePointTemp(TextView statsText, float cx, float cy,
+//                                 ImageView iv, Bitmap bmp,
+//                                 CameraHandler.TempFrameSnapshot snap) {
+//        try {
+//            // View → displayed image rect
+//            RectF imgRect = getDisplayedImageRect(iv);
+//            if (imgRect.width() <= 1f || imgRect.height() <= 1f) {
+//                statsText.setText("Temp: --°C");
+//                return;
+//            }
+//
+//            // Clamp crosshair to image area (so it works fully to the edges)
+//            float px = Math.max(imgRect.left, Math.min(cx, imgRect.right));
+//            float py = Math.max(imgRect.top,  Math.min(cy, imgRect.bottom));
+//
+//            // View → bitmap coords
+//            float scaleX = (float) bmp.getWidth()  / imgRect.width();
+//            float scaleY = (float) bmp.getHeight() / imgRect.height();
+//            float bx = (px - imgRect.left) * scaleX;
+//            float by = (py - imgRect.top)  * scaleY;
+//
+//            // Bitmap → thermal grid (continuous coords for bilinear)
+//            float gx = (float) snap.w / bmp.getWidth();
+//            float gy = (float) snap.h / bmp.getHeight();
+//            float txf = bx * gx;
+//            float tyf = by * gy;
+//
+//            // Bilinear sampling on thermal grid
+//            int x0 = clamp((int) Math.floor(txf), 0, snap.w - 1);
+//            int y0 = clamp((int) Math.floor(tyf), 0, snap.h - 1);
+//            int x1 = clamp(x0 + 1, 0, snap.w - 1);
+//            int y1 = clamp(y0 + 1, 0, snap.h - 1);
+//
+//            float wx = txf - x0;
+//            float wy = tyf - y0;
+//
+//            float[] t = snap.tempC;
+//            float t00 = t[y0 * snap.w + x0];
+//            float t10 = t[y0 * snap.w + x1];
+//            float t01 = t[y1 * snap.w + x0];
+//            float t11 = t[y1 * snap.w + x1];
+//
+//            // bilinear interpolation
+//            float top = t00 * (1 - wx) + t10 * wx;
+//            float bot = t01 * (1 - wx) + t11 * wx;
+//            float temp = top * (1 - wy) + bot * wy;
+//
+//            // (Optional) micro-average around the point for stability
+//            // temp = smooth3x3(snap, txf, tyf); // skip if not needed
+//
+//            statsText.setText(String.format(java.util.Locale.US, "Temp: %.1f°C", temp));
+//
+//        } catch (Exception e) {
+//            Log.w(TAG, "updatePointTemp failed", e);
+//            statsText.setText("Temp: --°C");
+//        }
+//    }
+
     private void updatePointTemp(TextView statsText, float cx, float cy,
                                  ImageView iv, Bitmap bmp,
                                  CameraHandler.TempFrameSnapshot snap) {
         try {
-            // View → displayed image rect
             RectF imgRect = getDisplayedImageRect(iv);
             if (imgRect.width() <= 1f || imgRect.height() <= 1f) {
                 statsText.setText("Temp: --°C");
                 return;
             }
 
-            // Clamp crosshair to image area (so it works fully to the edges)
+            // Clamp touch to displayed image area
             float px = Math.max(imgRect.left, Math.min(cx, imgRect.right));
             float py = Math.max(imgRect.top,  Math.min(cy, imgRect.bottom));
 
-            // View → bitmap coords
-            float scaleX = (float) bmp.getWidth()  / imgRect.width();
-            float scaleY = (float) bmp.getHeight() / imgRect.height();
-            float bx = (px - imgRect.left) * scaleX;
-            float by = (py - imgRect.top)  * scaleY;
+            // View -> bitmap coords
+            float bx = (px - imgRect.left) * ((float) bmp.getWidth()  / imgRect.width());
+            float by = (py - imgRect.top)  * ((float) bmp.getHeight() / imgRect.height());
 
-            // Bitmap → thermal grid (continuous coords for bilinear)
-            float gx = (float) snap.w / bmp.getWidth();
-            float gy = (float) snap.h / bmp.getHeight();
-            float txf = bx * gx;
-            float tyf = by * gy;
+            // Bitmap -> thermal grid (continuous)
+            float txf = bx * ((float) snap.w / bmp.getWidth());
+            float tyf = by * ((float) snap.h / bmp.getHeight());
 
-            // Bilinear sampling on thermal grid
-            int x0 = clamp((int) Math.floor(txf), 0, snap.w - 1);
-            int y0 = clamp((int) Math.floor(tyf), 0, snap.h - 1);
-            int x1 = clamp(x0 + 1, 0, snap.w - 1);
-            int y1 = clamp(y0 + 1, 0, snap.h - 1);
+            // 3×3 neighborhood average in the thermal grid
+            int cxT = clamp(Math.round(txf), 0, snap.w - 1);
+            int cyT = clamp(Math.round(tyf), 0, snap.h - 1);
 
-            float wx = txf - x0;
-            float wy = tyf - y0;
+            double sum = 0;
+            int cnt = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                int yy = clamp(cyT + dy, 0, snap.h - 1);
+                int rowOff = yy * snap.w;
+                for (int dx = -1; dx <= 1; dx++) {
+                    int xx = clamp(cxT + dx, 0, snap.w - 1);
+                    sum += snap.tempC[rowOff + xx];
+                    cnt++;
+                }
+            }
+            double temp = (cnt > 0) ? (sum / cnt) : Double.NaN;
 
-            float[] t = snap.tempC;
-            float t00 = t[y0 * snap.w + x0];
-            float t10 = t[y0 * snap.w + x1];
-            float t01 = t[y1 * snap.w + x0];
-            float t11 = t[y1 * snap.w + x1];
-
-            // bilinear interpolation
-            float top = t00 * (1 - wx) + t10 * wx;
-            float bot = t01 * (1 - wx) + t11 * wx;
-            float temp = top * (1 - wy) + bot * wy;
-
-            // (Optional) micro-average around the point for stability
-            // temp = smooth3x3(snap, txf, tyf); // skip if not needed
-
-            statsText.setText(String.format(java.util.Locale.US, "Temp: %.1f°C", temp));
+            if (Double.isFinite(temp)) {
+                statsText.setText(String.format(java.util.Locale.US, "Temp: %.1f°C", temp));
+            } else {
+                statsText.setText("Temp: --°C");
+            }
 
         } catch (Exception e) {
-            Log.w(TAG, "updatePointTemp failed", e);
             statsText.setText("Temp: --°C");
         }
     }
+
 
     private void updateMultiPointTemps(TextView statsText, ArrayList<MultiPointOverlay.PointData> pts,
                                        ImageView iv, Bitmap bmp,
