@@ -572,11 +572,8 @@ public class MainActivity extends AppCompatActivity {
                                    ImageView iv, Bitmap bmp,
                                    CameraHandler.TempFrameSnapshot snap) {
         currentMode = MODE_POINT;
-
-        // Remove all overlays except the ImageView
         clearOverlaysKeepImage(container);
 
-        // Ensure we have the selection overlay in the container
         if (selectionOverlay == null) {
             selectionOverlay = new SelectionOverlay(this);
         }
@@ -587,24 +584,40 @@ public class MainActivity extends AppCompatActivity {
         }
 
         selectionOverlay.setMode(SelectionOverlay.MODE_POINT);
-        selectionOverlay.setOnBoundsChangedListener(null); // not used in point mode
+        selectionOverlay.setOnBoundsChangedListener(null);
 
-        // Make crosshair tiny so its center can reach whole image
+        // Initialize crosshair at image center
         iv.post(() -> {
             RectF img = getDisplayedImageRect(iv);
-            float cx = img.centerX(), cy = img.centerY();
-            float half = 10f; // 20x20
-            selectionOverlay.setBounds(new RectF(cx - half, cy - half, cx + half, cy + half));
+            if (img.width() <= 1f || img.height() <= 1f) return;
 
-            // Initial temp read
+            float cx = img.centerX();
+            float cy = img.centerY();
+            float half = 10f;
+
+            selectionOverlay.setBounds(new RectF(cx - half, cy - half, cx + half, cy + half));
             updatePointTemp(statsText, cx, cy, iv, bmp, snap);
         });
 
-        // Live drag → update temp
-        selectionOverlay.setOnPointChangedListener((cx, cy) ->
-                updatePointTemp(statsText, cx, cy, iv, bmp, snap));
+        // ENHANCED: Constrain point movement to image bounds
+        selectionOverlay.setOnPointChangedListener((cx, cy) -> {
+            RectF imgBounds = getDisplayedImageRect(iv);
 
-        // Make sure it’s on top and receives touch
+            // Clamp to image area
+            float clampedX = Math.max(imgBounds.left, Math.min(cx, imgBounds.right));
+            float clampedY = Math.max(imgBounds.top, Math.min(cy, imgBounds.bottom));
+
+            // If point was dragged outside, move it back
+            if (clampedX != cx || clampedY != cy) {
+                float half = 10f;
+                selectionOverlay.setBounds(new RectF(
+                        clampedX - half, clampedY - half,
+                        clampedX + half, clampedY + half));
+            }
+
+            updatePointTemp(statsText, clampedX, clampedY, iv, bmp, snap);
+        });
+
         selectionOverlay.setClickable(true);
         selectionOverlay.bringToFront();
         container.invalidate();
@@ -616,10 +629,8 @@ public class MainActivity extends AppCompatActivity {
                                   CameraHandler.TempFrameSnapshot snap,
                                   int maxPoints) {
         currentMode = MODE_POINT_MULTI;
-
         clearOverlaysKeepImage(container);
 
-        // Remove single-spot overlay if still attached
         if (selectionOverlay != null && selectionOverlay.getParent() == container) {
             container.removeView(selectionOverlay);
         }
@@ -633,57 +644,102 @@ public class MainActivity extends AppCompatActivity {
             container.addView(multiPointOverlay);
         }
 
-        // Apply the requested max immediately
         multiPointOverlay.setMaxPoints(maxPoints);
-
         multiPointOverlay.bringToFront();
-        multiPointOverlay.setOnPointsChangedListener(points ->
-                updateMultiPointTemps(statsText, points, iv, bmp, snap));
 
-        // Auto-seed up to maxPoints so the UI shows the right count immediately
+        // ENHANCED: Validate points are within image bounds after updates
+        multiPointOverlay.setOnPointsChangedListener(points -> {
+            RectF imgBounds = getDisplayedImageRect(iv);
+
+            // Clamp all points to image area
+            boolean needsCorrection = false;
+            for (MultiPointOverlay.PointData p : points) {
+                float originalX = p.x;
+                float originalY = p.y;
+
+                p.x = Math.max(imgBounds.left, Math.min(p.x, imgBounds.right));
+                p.y = Math.max(imgBounds.top, Math.min(p.y, imgBounds.bottom));
+
+                if (p.x != originalX || p.y != originalY) {
+                    needsCorrection = true;
+                }
+            }
+
+            if (needsCorrection) {
+                multiPointOverlay.invalidate();
+            }
+
+            updateMultiPointTemps(statsText, points, iv, bmp, snap);
+        });
+
+        // Auto-seed points within image bounds
         iv.post(() -> {
             RectF img = getDisplayedImageRect(iv);
             if (img.width() <= 0 || img.height() <= 0) return;
 
-            int need = maxPoints - multiPointOverlay.getPointCount();
-            if (need <= 0) return;
+            multiPointOverlay.clearPoints();
 
-            float cx = img.centerX(), cy = img.centerY();
-            float span = img.width() * 0.28f;
+            float cx = img.centerX();
+            float cy = img.centerY();
+            float spanX = img.width() * 0.25f;
+            float spanY = img.height() * 0.25f;
 
-            // Always ensure at least one at center
-            if (multiPointOverlay.getPointCount() == 0) {
-                multiPointOverlay.addPoint(cx, cy);
-            }
-
-            // Add symmetric points left/right/up/down until reaching max
-            while (multiPointOverlay.getPointCount() < maxPoints) {
-                int n = multiPointOverlay.getPointCount();
-                switch (n) {
-                    case 1: multiPointOverlay.addPoint(cx - span, cy); break;
-                    case 2: multiPointOverlay.addPoint(cx + span, cy); break;
-                    case 3: multiPointOverlay.addPoint(cx, cy - span * 0.5f); break;
-                    case 4: multiPointOverlay.addPoint(cx, cy + span * 0.5f); break;
-                    case 5: multiPointOverlay.addPoint(cx - span * 0.5f, cy - span * 0.5f); break;
-                    case 6: multiPointOverlay.addPoint(cx + span * 0.5f, cy + span * 0.5f); break;
-                    case 7: multiPointOverlay.addPoint(cx - span * 0.5f, cy + span * 0.5f); break;
-                    case 8: multiPointOverlay.addPoint(cx + span * 0.5f, cy - span * 0.5f); break;
-                    default: multiPointOverlay.addPoint(cx, cy); break;
-                }
+            // Add points in a grid pattern within image bounds
+            switch (maxPoints) {
+                case 1:
+                    multiPointOverlay.addPoint(cx, cy);
+                    break;
+                case 3:
+                    multiPointOverlay.addPoint(cx, cy);
+                    multiPointOverlay.addPoint(cx - spanX, cy);
+                    multiPointOverlay.addPoint(cx + spanX, cy);
+                    break;
+                case 5:
+                    multiPointOverlay.addPoint(cx, cy);
+                    multiPointOverlay.addPoint(cx - spanX, cy);
+                    multiPointOverlay.addPoint(cx + spanX, cy);
+                    multiPointOverlay.addPoint(cx, cy - spanY);
+                    multiPointOverlay.addPoint(cx, cy + spanY);
+                    break;
+                case 10:
+                    // Center
+                    multiPointOverlay.addPoint(cx, cy);
+                    // Cross pattern
+                    multiPointOverlay.addPoint(cx - spanX, cy);
+                    multiPointOverlay.addPoint(cx + spanX, cy);
+                    multiPointOverlay.addPoint(cx, cy - spanY);
+                    multiPointOverlay.addPoint(cx, cy + spanY);
+                    // Diagonals
+                    multiPointOverlay.addPoint(cx - spanX*0.7f, cy - spanY*0.7f);
+                    multiPointOverlay.addPoint(cx + spanX*0.7f, cy + spanY*0.7f);
+                    multiPointOverlay.addPoint(cx - spanX*0.7f, cy + spanY*0.7f);
+                    multiPointOverlay.addPoint(cx + spanX*0.7f, cy - spanY*0.7f);
+                    // Extra center offset
+                    multiPointOverlay.addPoint(cx, cy - spanY*0.5f);
+                    break;
+                default:
+                    // Generic grid
+                    multiPointOverlay.addPoint(cx, cy);
+                    for (int i = 1; i < maxPoints; i++) {
+                        float angle = (float)(2 * Math.PI * i / maxPoints);
+                        float x = cx + spanX * (float)Math.cos(angle);
+                        float y = cy + spanY * (float)Math.sin(angle);
+                        multiPointOverlay.addPoint(x, y);
+                    }
+                    break;
             }
         });
     }
 
-
-
+    /**
+     * ENHANCED: Rectangle mode with image boundary enforcement
+     */
     private void enableRectangleMode(FrameLayout container, TextView statsText,
                                      ImageView iv, Bitmap bmp,
                                      CameraHandler.TempFrameSnapshot snap) {
         currentMode = MODE_RECT;
-
         clearOverlaysKeepImage(container);
 
-        // Remove multi overlay if present
         if (multiPointOverlay != null && multiPointOverlay.getParent() == container) {
             container.removeView(multiPointOverlay);
         }
@@ -699,14 +755,69 @@ public class MainActivity extends AppCompatActivity {
 
         selectionOverlay.setMode(SelectionOverlay.MODE_RECT);
         selectionOverlay.setOnPointChangedListener(null);
-        selectionOverlay.setOnBoundsChangedListener(bounds ->
-                updateRoiStats(statsText, bounds, iv, bmp, snap));
+
+        // ENHANCED: Constrain rectangle to image bounds during dragging
+        selectionOverlay.setOnBoundsChangedListener(bounds -> {
+            RectF imgBounds = getDisplayedImageRect(iv);
+
+            // Clamp rectangle to image area
+            RectF constrainedBounds = new RectF(bounds);
+
+            // Ensure rectangle stays within image
+            if (constrainedBounds.left < imgBounds.left) {
+                float shift = imgBounds.left - constrainedBounds.left;
+                constrainedBounds.left += shift;
+                constrainedBounds.right += shift;
+            }
+            if (constrainedBounds.top < imgBounds.top) {
+                float shift = imgBounds.top - constrainedBounds.top;
+                constrainedBounds.top += shift;
+                constrainedBounds.bottom += shift;
+            }
+            if (constrainedBounds.right > imgBounds.right) {
+                float shift = constrainedBounds.right - imgBounds.right;
+                constrainedBounds.left -= shift;
+                constrainedBounds.right -= shift;
+            }
+            if (constrainedBounds.bottom > imgBounds.bottom) {
+                float shift = constrainedBounds.bottom - imgBounds.bottom;
+                constrainedBounds.top -= shift;
+                constrainedBounds.bottom -= shift;
+            }
+
+            // Final hard clamp
+            constrainedBounds.left = Math.max(imgBounds.left, constrainedBounds.left);
+            constrainedBounds.top = Math.max(imgBounds.top, constrainedBounds.top);
+            constrainedBounds.right = Math.min(imgBounds.right, constrainedBounds.right);
+            constrainedBounds.bottom = Math.min(imgBounds.bottom, constrainedBounds.bottom);
+
+            // Update if needed
+            if (!constrainedBounds.equals(bounds)) {
+                selectionOverlay.setBounds(constrainedBounds);
+            }
+
+            updateRoiStats(statsText, constrainedBounds, iv, bmp, snap);
+        });
 
         selectionOverlay.bringToFront();
 
-        // Optional: recompute once
-        selectionOverlay.post(() ->
-                updateRoiStats(statsText, selectionOverlay.getBounds(), iv, bmp, snap));
+        // Initialize rectangle within image bounds
+        iv.post(() -> {
+            RectF imgRect = getDisplayedImageRect(iv);
+            if (imgRect.width() <= 1f || imgRect.height() <= 1f) return;
+
+            float w = Math.min(imgRect.width() * 0.4f, imgRect.width() - 20);
+            float h = Math.min(imgRect.height() * 0.4f, imgRect.height() - 20);
+            float left = imgRect.centerX() - w / 2f;
+            float top = imgRect.centerY() - h / 2f;
+
+            // Ensure within bounds
+            left = Math.max(imgRect.left, Math.min(left, imgRect.right - w));
+            top = Math.max(imgRect.top, Math.min(top, imgRect.bottom - h));
+
+            selectionOverlay.setBounds(new RectF(left, top, left + w, top + h));
+            updateRoiStats(statsText, selectionOverlay.getBounds(), iv, bmp, snap);
+        });
     }
 
 
