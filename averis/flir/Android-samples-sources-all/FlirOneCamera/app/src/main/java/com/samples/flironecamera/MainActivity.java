@@ -13,6 +13,8 @@ package com.samples.flironecamera;
 import static com.samples.flironecamera.R.*;
 
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Paint;
 import android.graphics.RectF;
 import android.os.Bundle;
 import android.os.Handler;
@@ -57,7 +59,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
-    private static final int UI_UPDATE_INTERVAL_MS = 50; // ~20 FPS UI cap
+    private static final int UI_UPDATE_INTERVAL_MS = 33; // ~20 FPS UI cap
 
     // Camera handler
     private CameraHandler cameraHandler;
@@ -164,22 +166,19 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // Prevent multiple simultaneous captures
         if (!isCapturing.compareAndSet(false, true)) {
             showMessage.show("Capture already in progress...");
             return;
         }
 
-        // Show progress indicator
         showMessage.show("Capturing thermal data...");
 
-        // Capture on background thread to avoid UI lag
         new Thread(() -> {
             try {
-                // 1. Copy the displayed MSX bitmap (fast)
+                // 1. Copy the displayed MSX bitmap
                 Bitmap msxCopy = copyBitmap(lastMsxBitmap);
 
-                // 2. Build full temperature snapshot (HEAVY - runs on background thread)
+                // 2. Build temperature snapshot
                 CameraHandler.TempFrameSnapshot tempSnap = cameraHandler.buildTempSnapshotSync();
 
                 // 3. Get min/max temperatures
@@ -190,16 +189,12 @@ public class MainActivity extends AppCompatActivity {
                 capturedMsxBitmap = msxCopy;
                 capturedTempSnapshot = tempSnap;
 
-                // 4. Save to gallery (background)
-                String filename = "FLIR_MSX_" + System.currentTimeMillis() + ".jpg";
-                saveBitmapToGallery(msxCopy, filename);
-
-                // 5. Show preview dialog on UI thread
+                // 4. Show preview dialog (NO SAVE HERE - removed!)
                 runOnUiThread(() -> {
                     if (tempSnap != null) {
                         showCapturePopupWithRoi(msxCopy, minC, maxC, tempSnap);
                     } else {
-                        showMessage.show("Capture saved, but thermal data unavailable");
+                        showMessage.show("Capture failed - thermal data unavailable");
                     }
                 });
 
@@ -291,9 +286,17 @@ public class MainActivity extends AppCompatActivity {
      * OPTIMIZED stream listener - minimal work on callback thread
      */
     private final CameraHandler.StreamDataListener streamDataListener = new CameraHandler.StreamDataListener() {
+        private int skipCounter = 0;
+
         @Override
         public void images(Bitmap msxBitmap, Bitmap dcBitmap) {
-            // Just store the latest bitmaps - no UI work here
+            // Skip every other frame to reduce memory pressure
+            skipCounter++;
+            if (skipCounter % 2 != 0) {
+                return; // Skip this frame
+            }
+
+            // Store the latest bitmaps
             lastMsxBitmap = msxBitmap;
             lastDcBitmap = dcBitmap;
 
@@ -308,6 +311,76 @@ public class MainActivity extends AppCompatActivity {
             }
         }
     };
+
+    /**
+     * Capture a view (including overlays) as a bitmap
+     */
+    private Bitmap captureViewAsBitmap(View view, TextView statsText) {
+        try {
+            // Ensure view is laid out
+            view.measure(
+                    View.MeasureSpec.makeMeasureSpec(view.getWidth(), View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(view.getHeight(), View.MeasureSpec.EXACTLY)
+            );
+            view.layout(view.getLeft(), view.getTop(), view.getRight(), view.getBottom());
+
+            // Create bitmap and draw view into it
+            Bitmap bitmap = Bitmap.createBitmap(
+                    view.getWidth(),
+                    view.getHeight(),
+                    Bitmap.Config.ARGB_8888
+            );
+
+            Canvas canvas = new Canvas(bitmap);
+
+            // Draw the view (image + overlays)
+            view.draw(canvas);
+
+            // Draw temperature stats text overlay
+            if (statsText != null && statsText.getText() != null) {
+                String tempText = statsText.getText().toString();
+
+                // Setup paint for temperature text
+                Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                textPaint.setColor(0xFFFFFFFF); // White
+                textPaint.setTextSize(40f); // Larger for visibility
+                textPaint.setShadowLayer(6f, 0f, 0f, 0xFF000000); // Black shadow for readability
+                textPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+
+                // Draw background rectangle for text
+                Paint bgPaint = new Paint();
+                bgPaint.setColor(0xAA000000); // Semi-transparent black
+                bgPaint.setStyle(Paint.Style.FILL);
+
+                // Measure text
+                android.graphics.Rect textBounds = new android.graphics.Rect();
+                textPaint.getTextBounds(tempText, 0, tempText.length(), textBounds);
+
+                // Position at top-left corner with padding
+                float padding = 20f;
+                float textX = padding;
+                float textY = padding + textBounds.height();
+
+                // Draw background
+                canvas.drawRect(
+                        textX - padding/2,
+                        textY - textBounds.height() - padding/2,
+                        textX + textBounds.width() + padding/2,
+                        textY + padding/2,
+                        bgPaint
+                );
+
+                // Draw text on top
+                canvas.drawText(tempText, textX, textY, textPaint);
+            }
+
+            return bitmap;
+
+        } catch (Exception e) {
+            Log.e(TAG, "View capture failed", e);
+            return null;
+        }
+    }
 
     /**
      * Update UI with latest frame (runs on UI thread, throttled)
@@ -407,6 +480,7 @@ public class MainActivity extends AppCompatActivity {
         Spinner modeSpinner = dialogView.findViewById(R.id.modeSpinner);
         LinearLayout countRow = dialogView.findViewById(R.id.countRow);
         Spinner countSpinner = dialogView.findViewById(R.id.countSpinner);
+        Button saveBtn = dialogView.findViewById(R.id.saveDialogBtn);
 
 
         imageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
@@ -486,7 +560,50 @@ public class MainActivity extends AppCompatActivity {
                 .setCancelable(true)
                 .create();
 
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setLayout(
+                    (int)(getResources().getDisplayMetrics().widthPixels * 0.95), // 95% screen width
+                    (int)(getResources().getDisplayMetrics().heightPixels * 0.85)  // 85% screen height
+            );
+        }
+
         closeBtn.setOnClickListener(v -> dialog.dismiss());
+
+        saveBtn.setOnClickListener(v -> {
+            saveBtn.setEnabled(false);
+            saveBtn.setText("Saving...");
+
+            new Thread(() -> {
+                try {
+                    // Capture the container with overlays AND temperature stats
+                    Bitmap capturedWithOverlay = captureViewAsBitmap(container, statsText);
+
+                    if (capturedWithOverlay != null) {
+                        String filename = "FLIR_Capture_" + System.currentTimeMillis() + ".jpg";
+                        saveBitmapToGallery(capturedWithOverlay, filename);
+
+                        runOnUiThread(() -> {
+                            showMessage.show("Saved to gallery!");
+                            saveBtn.setText("Saved ✓");
+                        });
+                    } else {
+                        runOnUiThread(() -> {
+                            showMessage.show("Save failed");
+                            saveBtn.setEnabled(true);
+                            saveBtn.setText("Save Image");
+                        });
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Save error", e);
+                    runOnUiThread(() -> {
+                        showMessage.show("Save failed: " + e.getMessage());
+                        saveBtn.setEnabled(true);
+                        saveBtn.setText("Save Image");
+                    });
+                }
+            }).start();
+        });
+
         dialog.show();
     }
 
@@ -497,61 +614,61 @@ public class MainActivity extends AppCompatActivity {
     private void updateRoiStats(TextView statsText, RectF roiView, ImageView iv,
                                 Bitmap bmp, CameraHandler.TempFrameSnapshot snap) {
         try {
-            if (bmp == null || snap == null || snap.tempC == null) return;
+            if (bmp == null || snap == null || snap.tempC == null) {
+                statsText.setText("High: --°C   Low: --°C");
+                return;
+            }
 
-            // 1) Map the ROI corners from VIEW space -> BITMAP pixel space using the actual image matrix
-            //    (This is more precise than scaling via displayed rect.)
-            PointF tl = mapViewToBitmap(iv, roiView.left,  roiView.top,    bmp);
-            PointF tr = mapViewToBitmap(iv, roiView.right, roiView.top,    bmp);
-            PointF bl = mapViewToBitmap(iv, roiView.left,  roiView.bottom, bmp);
-            PointF br = mapViewToBitmap(iv, roiView.right, roiView.bottom, bmp);
+            RectF imgRect = getDisplayedImageRect(iv);
+            if (imgRect.width() <= 1f || imgRect.height() <= 1f) {
+                statsText.setText("High: --°C   Low: --°C");
+                return;
+            }
 
-            // Bounding box in bitmap space (handles any non-uniform scale)
-            float bx0f = Math.min(Math.min(tl.x, tr.x), Math.min(bl.x, br.x));
-            float by0f = Math.min(Math.min(tl.y, tr.y), Math.min(bl.y, br.y));
-            float bx1f = Math.max(Math.max(tl.x, tr.x), Math.max(bl.x, br.x));
-            float by1f = Math.max(Math.max(tl.y, tr.y), Math.max(bl.y, br.y));
+            // Map ROI corners to bitmap coordinates
+            float bx0 = Math.max(0, (Math.max(roiView.left, imgRect.left) - imgRect.left) * (bmp.getWidth() / imgRect.width()));
+            float by0 = Math.max(0, (Math.max(roiView.top, imgRect.top) - imgRect.top) * (bmp.getHeight() / imgRect.height()));
+            float bx1 = Math.min(bmp.getWidth(), (Math.min(roiView.right, imgRect.right) - imgRect.left) * (bmp.getWidth() / imgRect.width()));
+            float by1 = Math.min(bmp.getHeight(), (Math.min(roiView.bottom, imgRect.bottom) - imgRect.top) * (bmp.getHeight() / imgRect.height()));
 
-            // Clamp to bitmap bounds
-            bx0f = Math.max(0, Math.min(bx0f, bmp.getWidth()  - 1));
-            by0f = Math.max(0, Math.min(by0f, bmp.getHeight() - 1));
-            bx1f = Math.max(0, Math.min(bx1f, bmp.getWidth()  - 1));
-            by1f = Math.max(0, Math.min(by1f, bmp.getHeight() - 1));
+            // Bitmap -> thermal coordinates
+            float tx0f = bx0 * ((float) snap.w / bmp.getWidth());
+            float ty0f = by0 * ((float) snap.h / bmp.getHeight());
+            float tx1f = bx1 * ((float) snap.w / bmp.getWidth());
+            float ty1f = by1 * ((float) snap.h / bmp.getHeight());
 
-            // 2) Map bitmap -> THERMAL grid (snap.w x snap.h)
-            float gx = (float) snap.w / bmp.getWidth();
-            float gy = (float) snap.h / bmp.getHeight();
-            float tx0f = bx0f * gx, ty0f = by0f * gy;
-            float tx1f = bx1f * gx, ty1f = by1f * gy;
-
-            // Convert to integer index range (half-open) and ensure at least 1 pixel
+            // Convert to integer range
             int tx0 = clamp((int) Math.floor(tx0f), 0, snap.w - 1);
             int ty0 = clamp((int) Math.floor(ty0f), 0, snap.h - 1);
-            int tx1 = clamp((int) Math.ceil (tx1f), 1, snap.w);   // half-open end
-            int ty1 = clamp((int) Math.ceil (ty1f), 1, snap.h);   // half-open end
+            int tx1 = clamp((int) Math.ceil(tx1f), 1, snap.w);
+            int ty1 = clamp((int) Math.ceil(ty1f), 1, snap.h);
 
-            // If the box is tiny and collapses to <1 thermal pixel, expand to a small 3×3 neighborhood
+            // Ensure at least 1 pixel
             if (tx1 - tx0 < 1) { tx0 = clamp(tx0 - 1, 0, snap.w - 1); tx1 = clamp(tx0 + 2, 1, snap.w); }
             if (ty1 - ty0 < 1) { ty0 = clamp(ty0 - 1, 0, snap.h - 1); ty1 = clamp(ty0 + 2, 1, snap.h); }
 
-            // 3) Scan the thermal snapshot in that ROI precisely
+            // Scan the thermal snapshot in that ROI
             float[] t = snap.tempC;
-            double minC = Double.POSITIVE_INFINITY, maxC = Double.NEGATIVE_INFINITY;
+            double minC = Double.POSITIVE_INFINITY;
+            double maxC = Double.NEGATIVE_INFINITY;
 
             for (int y = ty0; y < ty1; y++) {
                 int row = y * snap.w;
                 for (int x = tx0; x < tx1; x++) {
                     float v = t[row + x];
-                    if (v < minC) minC = v;
-                    if (v > maxC) maxC = v;
+                    if (Float.isFinite(v)) {
+                        if (v < minC) minC = v;
+                        if (v > maxC) maxC = v;
+                    }
                 }
             }
 
-            if (minC == Double.POSITIVE_INFINITY) {
-                statsText.setText("High: --°C   Low: --°C");
-            } else {
+            if (Double.isFinite(minC) && Double.isFinite(maxC)) {
                 statsText.setText(String.format(java.util.Locale.US, "High: %.1f°C   Low: %.1f°C", maxC, minC));
+            } else {
+                statsText.setText("High: --°C   Low: --°C");
             }
+
         } catch (Exception e) {
             Log.e(TAG, "ROI stats calculation error", e);
             statsText.setText("High: --°C   Low: --°C");
@@ -596,18 +713,18 @@ public class MainActivity extends AppCompatActivity {
             float half = 10f;
 
             selectionOverlay.setBounds(new RectF(cx - half, cy - half, cx + half, cy + half));
-            updatePointTemp(statsText, cx, cy, iv, bmp, snap);
+            updatePointTempFromSnapshot(statsText, cx, cy, iv, bmp, snap);
         });
 
-        // ENHANCED: Constrain point movement to image bounds
+        // CRITICAL: Constrain crosshair to ONLY the displayed image area
         selectionOverlay.setOnPointChangedListener((cx, cy) -> {
             RectF imgBounds = getDisplayedImageRect(iv);
 
-            // Clamp to image area
+            // Force crosshair to stay within image bounds
             float clampedX = Math.max(imgBounds.left, Math.min(cx, imgBounds.right));
             float clampedY = Math.max(imgBounds.top, Math.min(cy, imgBounds.bottom));
 
-            // If point was dragged outside, move it back
+            // If dragged outside, snap it back
             if (clampedX != cx || clampedY != cy) {
                 float half = 10f;
                 selectionOverlay.setBounds(new RectF(
@@ -615,7 +732,7 @@ public class MainActivity extends AppCompatActivity {
                         clampedX + half, clampedY + half));
             }
 
-            updatePointTemp(statsText, clampedX, clampedY, iv, bmp, snap);
+            updatePointTempFromSnapshot(statsText, clampedX, clampedY, iv, bmp, snap);
         });
 
         selectionOverlay.setClickable(true);
@@ -623,6 +740,51 @@ public class MainActivity extends AppCompatActivity {
         container.invalidate();
     }
 
+    private void updatePointTempFromSnapshot(TextView statsText, float cx, float cy,
+                                             ImageView iv, Bitmap bmp,
+                                             CameraHandler.TempFrameSnapshot snap) {
+        try {
+            if (bmp == null || snap == null || snap.tempC == null) {
+                statsText.setText("Temp: --°C");
+                return;
+            }
+
+            RectF imgRect = getDisplayedImageRect(iv);
+            if (imgRect.width() <= 1f || imgRect.height() <= 1f) {
+                statsText.setText("Temp: --°C");
+                return;
+            }
+
+            // Clamp touch to displayed image area
+            float px = Math.max(imgRect.left, Math.min(cx, imgRect.right));
+            float py = Math.max(imgRect.top, Math.min(cy, imgRect.bottom));
+
+            // View -> bitmap coords
+            float bx = (px - imgRect.left) * ((float) bmp.getWidth() / imgRect.width());
+            float by = (py - imgRect.top) * ((float) bmp.getHeight() / imgRect.height());
+
+            // Bitmap -> thermal grid
+            float txf = bx * ((float) snap.w / bmp.getWidth());
+            float tyf = by * ((float) snap.h / bmp.getHeight());
+
+            // Read EXACT center pixel (no averaging)
+            int thermalX = clamp(Math.round(txf), 0, snap.w - 1);
+            int thermalY = clamp(Math.round(tyf), 0, snap.h - 1);
+
+            // Read single pixel temperature
+            float temp = snap.tempC[thermalY * snap.w + thermalX];
+
+            if (Float.isFinite(temp)) {
+                statsText.setText(String.format(java.util.Locale.US, "Temp: %.1f°C", temp));
+            } else {
+                statsText.setText("Temp: --°C");
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "updatePointTempFromSnapshot failed: " + e.getMessage(), e);
+            statsText.setText("Temp: --°C");
+        }
+    }
 
     private void enableMultiPoint(FrameLayout container, TextView statsText,
                                   ImageView iv, Bitmap bmp,
@@ -647,32 +809,21 @@ public class MainActivity extends AppCompatActivity {
         multiPointOverlay.setMaxPoints(maxPoints);
         multiPointOverlay.bringToFront();
 
-        // ENHANCED: Validate points are within image bounds after updates
+        // CRITICAL: Constrain all points to image bounds
         multiPointOverlay.setOnPointsChangedListener(points -> {
             RectF imgBounds = getDisplayedImageRect(iv);
 
             // Clamp all points to image area
-            boolean needsCorrection = false;
             for (MultiPointOverlay.PointData p : points) {
-                float originalX = p.x;
-                float originalY = p.y;
-
                 p.x = Math.max(imgBounds.left, Math.min(p.x, imgBounds.right));
                 p.y = Math.max(imgBounds.top, Math.min(p.y, imgBounds.bottom));
-
-                if (p.x != originalX || p.y != originalY) {
-                    needsCorrection = true;
-                }
             }
 
-            if (needsCorrection) {
-                multiPointOverlay.invalidate();
-            }
-
-            updateMultiPointTemps(statsText, points, iv, bmp, snap);
+            multiPointOverlay.invalidate();
+            updateMultiPointTempsFromSnapshot(statsText, points, iv, bmp, snap);
         });
 
-        // Auto-seed points within image bounds
+        // Auto-seed points WITHIN image bounds only
         iv.post(() -> {
             RectF img = getDisplayedImageRect(iv);
             if (img.width() <= 0 || img.height() <= 0) return;
@@ -681,10 +832,10 @@ public class MainActivity extends AppCompatActivity {
 
             float cx = img.centerX();
             float cy = img.centerY();
+            // Use smaller span to stay within image
             float spanX = img.width() * 0.25f;
             float spanY = img.height() * 0.25f;
 
-            // Add points in a grid pattern within image bounds
             switch (maxPoints) {
                 case 1:
                     multiPointOverlay.addPoint(cx, cy);
@@ -702,23 +853,18 @@ public class MainActivity extends AppCompatActivity {
                     multiPointOverlay.addPoint(cx, cy + spanY);
                     break;
                 case 10:
-                    // Center
                     multiPointOverlay.addPoint(cx, cy);
-                    // Cross pattern
                     multiPointOverlay.addPoint(cx - spanX, cy);
                     multiPointOverlay.addPoint(cx + spanX, cy);
                     multiPointOverlay.addPoint(cx, cy - spanY);
                     multiPointOverlay.addPoint(cx, cy + spanY);
-                    // Diagonals
                     multiPointOverlay.addPoint(cx - spanX*0.7f, cy - spanY*0.7f);
                     multiPointOverlay.addPoint(cx + spanX*0.7f, cy + spanY*0.7f);
                     multiPointOverlay.addPoint(cx - spanX*0.7f, cy + spanY*0.7f);
                     multiPointOverlay.addPoint(cx + spanX*0.7f, cy - spanY*0.7f);
-                    // Extra center offset
                     multiPointOverlay.addPoint(cx, cy - spanY*0.5f);
                     break;
                 default:
-                    // Generic grid
                     multiPointOverlay.addPoint(cx, cy);
                     for (int i = 1; i < maxPoints; i++) {
                         float angle = (float)(2 * Math.PI * i / maxPoints);
@@ -729,6 +875,34 @@ public class MainActivity extends AppCompatActivity {
                     break;
             }
         });
+    }
+
+    private void updateMultiPointTempsFromSnapshot(TextView statsText,
+                                                   ArrayList<MultiPointOverlay.PointData> pts,
+                                                   ImageView iv, Bitmap bmp,
+                                                   CameraHandler.TempFrameSnapshot snap) {
+        StringBuilder sb = new StringBuilder();
+
+        for (MultiPointOverlay.PointData p : pts) {
+            // getPointTemp() is already fixed, so this should work now
+            double t = getPointTemp(iv, bmp, snap, p.x, p.y);
+            p.temp = t;
+
+            if (Double.isFinite(t)) {
+                sb.append(String.format(java.util.Locale.US, "Point %d: %.1f°C\n", p.index, t));
+            } else {
+                sb.append(String.format(java.util.Locale.US, "Point %d: --°C\n", p.index));
+            }
+        }
+
+        statsText.setText(sb.toString().trim());
+    }
+
+    private double getPointTempFromSnapshot(ImageView iv, Bitmap bmp,
+                                            CameraHandler.TempFrameSnapshot snap,
+                                            float cx, float cy) {
+        // Same as getPointTemp() - uses snapshot array
+        return getPointTemp(iv, bmp, snap, cx, cy);
     }
 
     /**
@@ -756,33 +930,36 @@ public class MainActivity extends AppCompatActivity {
         selectionOverlay.setMode(SelectionOverlay.MODE_RECT);
         selectionOverlay.setOnPointChangedListener(null);
 
-        // ENHANCED: Constrain rectangle to image bounds during dragging
+        // CRITICAL: Constrain rectangle to image bounds
         selectionOverlay.setOnBoundsChangedListener(bounds -> {
             RectF imgBounds = getDisplayedImageRect(iv);
-
-            // Clamp rectangle to image area
             RectF constrainedBounds = new RectF(bounds);
 
-            // Ensure rectangle stays within image
+            // Clamp all edges to image bounds
+            constrainedBounds.left = Math.max(imgBounds.left, Math.min(constrainedBounds.left, imgBounds.right));
+            constrainedBounds.top = Math.max(imgBounds.top, Math.min(constrainedBounds.top, imgBounds.bottom));
+            constrainedBounds.right = Math.max(imgBounds.left, Math.min(constrainedBounds.right, imgBounds.right));
+            constrainedBounds.bottom = Math.max(imgBounds.top, Math.min(constrainedBounds.bottom, imgBounds.bottom));
+
+            // Ensure rectangle stays within bounds (shift if needed)
+            float width = constrainedBounds.width();
+            float height = constrainedBounds.height();
+
             if (constrainedBounds.left < imgBounds.left) {
-                float shift = imgBounds.left - constrainedBounds.left;
-                constrainedBounds.left += shift;
-                constrainedBounds.right += shift;
-            }
-            if (constrainedBounds.top < imgBounds.top) {
-                float shift = imgBounds.top - constrainedBounds.top;
-                constrainedBounds.top += shift;
-                constrainedBounds.bottom += shift;
+                constrainedBounds.left = imgBounds.left;
+                constrainedBounds.right = imgBounds.left + width;
             }
             if (constrainedBounds.right > imgBounds.right) {
-                float shift = constrainedBounds.right - imgBounds.right;
-                constrainedBounds.left -= shift;
-                constrainedBounds.right -= shift;
+                constrainedBounds.right = imgBounds.right;
+                constrainedBounds.left = imgBounds.right - width;
+            }
+            if (constrainedBounds.top < imgBounds.top) {
+                constrainedBounds.top = imgBounds.top;
+                constrainedBounds.bottom = imgBounds.top + height;
             }
             if (constrainedBounds.bottom > imgBounds.bottom) {
-                float shift = constrainedBounds.bottom - imgBounds.bottom;
-                constrainedBounds.top -= shift;
-                constrainedBounds.bottom -= shift;
+                constrainedBounds.bottom = imgBounds.bottom;
+                constrainedBounds.top = imgBounds.bottom - height;
             }
 
             // Final hard clamp
@@ -791,7 +968,7 @@ public class MainActivity extends AppCompatActivity {
             constrainedBounds.right = Math.min(imgBounds.right, constrainedBounds.right);
             constrainedBounds.bottom = Math.min(imgBounds.bottom, constrainedBounds.bottom);
 
-            // Update if needed
+            // Update overlay if needed
             if (!constrainedBounds.equals(bounds)) {
                 selectionOverlay.setBounds(constrainedBounds);
             }
@@ -801,17 +978,18 @@ public class MainActivity extends AppCompatActivity {
 
         selectionOverlay.bringToFront();
 
-        // Initialize rectangle within image bounds
+        // Initialize rectangle WITHIN image bounds
         iv.post(() -> {
             RectF imgRect = getDisplayedImageRect(iv);
             if (imgRect.width() <= 1f || imgRect.height() <= 1f) return;
 
-            float w = Math.min(imgRect.width() * 0.4f, imgRect.width() - 20);
-            float h = Math.min(imgRect.height() * 0.4f, imgRect.height() - 20);
+            // Make rectangle smaller to ensure it stays within image
+            float w = Math.min(imgRect.width() * 0.4f, imgRect.width() - 40);
+            float h = Math.min(imgRect.height() * 0.4f, imgRect.height() - 40);
             float left = imgRect.centerX() - w / 2f;
             float top = imgRect.centerY() - h / 2f;
 
-            // Ensure within bounds
+            // Ensure within image bounds
             left = Math.max(imgRect.left, Math.min(left, imgRect.right - w));
             top = Math.max(imgRect.top, Math.min(top, imgRect.bottom - h));
 
@@ -885,48 +1063,44 @@ public class MainActivity extends AppCompatActivity {
                                  ImageView iv, Bitmap bmp,
                                  CameraHandler.TempFrameSnapshot snap) {
         try {
+            if (bmp == null) {
+                statsText.setText("Temp: --°C");
+                return;
+            }
+
             RectF imgRect = getDisplayedImageRect(iv);
             if (imgRect.width() <= 1f || imgRect.height() <= 1f) {
                 statsText.setText("Temp: --°C");
                 return;
             }
 
-            // Clamp touch to displayed image area
+            // Clamp to displayed image bounds
             float px = Math.max(imgRect.left, Math.min(cx, imgRect.right));
-            float py = Math.max(imgRect.top,  Math.min(cy, imgRect.bottom));
+            float py = Math.max(imgRect.top, Math.min(cy, imgRect.bottom));
 
-            // View -> bitmap coords
-            float bx = (px - imgRect.left) * ((float) bmp.getWidth()  / imgRect.width());
-            float by = (py - imgRect.top)  * ((float) bmp.getHeight() / imgRect.height());
+            // Convert view coordinates to bitmap pixel coordinates
+            float scaleX = (float) bmp.getWidth() / imgRect.width();
+            float scaleY = (float) bmp.getHeight() / imgRect.height();
+            int bitmapX = Math.round((px - imgRect.left) * scaleX);
+            int bitmapY = Math.round((py - imgRect.top) * scaleY);
 
-            // Bitmap -> thermal grid (continuous)
-            float txf = bx * ((float) snap.w / bmp.getWidth());
-            float tyf = by * ((float) snap.h / bmp.getHeight());
+            // Clamp to bitmap bounds
+            bitmapX = clamp(bitmapX, 0, bmp.getWidth() - 1);
+            bitmapY = clamp(bitmapY, 0, bmp.getHeight() - 1);
 
-            // 3×3 neighborhood average in the thermal grid
-            int cxT = clamp(Math.round(txf), 0, snap.w - 1);
-            int cyT = clamp(Math.round(tyf), 0, snap.h - 1);
+            // Use CameraHandler method that handles bitmap→thermal scaling
+            Double temp = cameraHandler.getTemperatureAtPoint(
+                    bitmapX, bitmapY, bmp.getWidth(), bmp.getHeight());
 
-            double sum = 0;
-            int cnt = 0;
-            for (int dy = -1; dy <= 1; dy++) {
-                int yy = clamp(cyT + dy, 0, snap.h - 1);
-                int rowOff = yy * snap.w;
-                for (int dx = -1; dx <= 1; dx++) {
-                    int xx = clamp(cxT + dx, 0, snap.w - 1);
-                    sum += snap.tempC[rowOff + xx];
-                    cnt++;
-                }
-            }
-            double temp = (cnt > 0) ? (sum / cnt) : Double.NaN;
-
-            if (Double.isFinite(temp)) {
-                statsText.setText(String.format(java.util.Locale.US, "Temp: %.1f°C", temp));
+            if (temp != null && Double.isFinite(temp)) {
+                statsText.setText(String.format(java.util.Locale.US,
+                        "Temp: %.1f°C", temp));
             } else {
                 statsText.setText("Temp: --°C");
             }
 
         } catch (Exception e) {
+            Log.e(TAG, "updatePointTemp failed", e);
             statsText.setText("Temp: --°C");
         }
     }
@@ -951,31 +1125,32 @@ public class MainActivity extends AppCompatActivity {
     private double getPointTemp(ImageView iv, Bitmap bmp,
                                 CameraHandler.TempFrameSnapshot snap,
                                 float cx, float cy) {
+        try {
+            if (bmp == null || snap == null || snap.tempC == null) {
+                return Double.NaN;
+            }
 
-        RectF imgRect = getDisplayedImageRect(iv);
+            RectF imgRect = getDisplayedImageRect(iv);
 
-        float px = Math.max(imgRect.left, Math.min(cx, imgRect.right));
-        float py = Math.max(imgRect.top,  Math.min(cy, imgRect.bottom));
+            float px = Math.max(imgRect.left, Math.min(cx, imgRect.right));
+            float py = Math.max(imgRect.top, Math.min(cy, imgRect.bottom));
 
-        float scaleX = (float) bmp.getWidth() / imgRect.width();
-        float scaleY = (float) bmp.getHeight() / imgRect.height();
+            float bx = (px - imgRect.left) * ((float) bmp.getWidth() / imgRect.width());
+            float by = (py - imgRect.top) * ((float) bmp.getHeight() / imgRect.height());
 
-        float bx = (px - imgRect.left) * scaleX;
-        float by = (py - imgRect.top)  * scaleY;
+            float txf = bx * ((float) snap.w / bmp.getWidth());
+            float tyf = by * ((float) snap.h / bmp.getHeight());
 
-        float gx = (float) snap.w / bmp.getWidth();
-        float gy = (float) snap.h / bmp.getHeight();
+            // Read EXACT pixel (no averaging)
+            int thermalX = clamp(Math.round(txf), 0, snap.w - 1);
+            int thermalY = clamp(Math.round(tyf), 0, snap.h - 1);
 
-        float txf = bx * gx;
-        float tyf = by * gy;
+            return snap.tempC[thermalY * snap.w + thermalX];
 
-        int x0 = clamp((int) txf, 0, snap.w - 1);
-        int y0 = clamp((int) tyf, 0, snap.h - 1);
-
-        return snap.tempC[y0 * snap.w + x0];
+        } catch (Exception e) {
+            return Double.NaN;
+        }
     }
-
-
 
 
     private PointF mapViewToBitmap(ImageView iv, float vx, float vy, Bitmap bmp) {

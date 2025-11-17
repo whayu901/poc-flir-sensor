@@ -59,14 +59,15 @@
     <FrameLayout
         android:id="@+id/previewContainer"
         android:layout_width="match_parent"
-        android:layout_height="260dp"
-        android:background="#222">
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:minHeight="300dp"
+        android:background="#000000">
 
         <ImageView
             android:id="@+id/capturedImageView"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:adjustViewBounds="true"
             android:scaleType="fitCenter" />
     </FrameLayout>
 
@@ -76,14 +77,37 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingTop="10dp"
+        android:paddingBottom="10dp"
         android:text="High: --°C   Low: --°C"
-        android:textSize="16sp" />
+        android:textSize="16sp"
+        android:textColor="#FFFFFF"
+        android:background="#333333"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"/>
 
-    <!-- Close button -->
-    <Button
-        android:id="@+id/closeDialogBtn"
+    <!-- Buttons row at the bottom -->
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Close"
-        android:layout_marginTop="12dp"/>
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:paddingTop="8dp">
+
+        <Button
+            android:id="@+id/saveDialogBtn"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Save Image"
+            android:layout_marginEnd="8dp"/>
+
+        <Button
+            android:id="@+id/closeDialogBtn"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Close"
+            android:layout_marginStart="8dp"/>
+
+    </LinearLayout>
 </LinearLayout>

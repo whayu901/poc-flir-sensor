@@ -49,7 +49,7 @@ class CameraHandler {
     private static final String TAG = "CameraHandler";
 
     // Performance tuning constants
-    private static final long MIN_FRAME_INTERVAL_MS = 100; // Max 10 FPS to UI
+    private static final long MIN_FRAME_INTERVAL_MS = 66; // Max 10 FPS to UI
 
     private StreamDataListener streamDataListener;
 
@@ -74,6 +74,7 @@ class CameraHandler {
     private Camera camera;
     private Stream connectedStream;
     private ThermalStreamer streamer;
+    private Bitmap reusableThermalBitmap = null;
 
     public double getLastMinTempC() { return lastMinTempC; }
     public double getLastMaxTempC() { return lastMaxTempC; }
@@ -102,38 +103,37 @@ class CameraHandler {
      * Automatically scales from bitmap coordinates to thermal sensor coordinates
      */
     public Double getTemperatureAtPoint(int bitmapX, int bitmapY, int bitmapWidth, int bitmapHeight) {
-        TempFrameSnapshot snap = lastSnapshot;
-        if (snap == null) return null;
+        if (streamer == null || lastW <= 0 || lastH <= 0) return null;
 
-        try {
-            // Get thermal image dimensions
-            int thermalW = snap.w;
-            int thermalH = snap.h;
+        final Double[] result = new Double[1];
 
-            if (thermalW <= 0 || thermalH <= 0 || bitmapWidth <= 0 || bitmapHeight <= 0) {
-                return null;
+        streamer.withThermalImage(thermalImage -> {
+            try {
+                int thermalW = thermalImage.getWidth();
+                int thermalH = thermalImage.getHeight();
+
+                if (thermalW <= 0 || thermalH <= 0) return;
+
+                // Scale bitmap to thermal coords
+                float scaleX = (float) thermalW / bitmapWidth;
+                float scaleY = (float) thermalH / bitmapHeight;
+
+                int thermalX = Math.round(bitmapX * scaleX);
+                int thermalY = Math.round(bitmapY * scaleY);
+
+                thermalX = Math.max(0, Math.min(thermalX, thermalW - 1));
+                thermalY = Math.max(0, Math.min(thermalY, thermalH - 1));
+
+                ThermalValue tv = thermalImage.getValueAt(new Point(thermalX, thermalY));
+                if (tv != null && Double.isFinite(tv.value)) {
+                    result[0] = tv.value;
+                }
+            } catch (Exception e) {
+                // Ignore
             }
+        });
 
-            // Scale bitmap coordinates to thermal coordinates
-            float scaleX = (float) thermalW / bitmapWidth;
-            float scaleY = (float) thermalH / bitmapHeight;
-
-            int thermalX = Math.round(bitmapX * scaleX);
-            int thermalY = Math.round(bitmapY * scaleY);
-
-            // Clamp to valid thermal range
-            thermalX = Math.max(0, Math.min(thermalX, thermalW - 1));
-            thermalY = Math.max(0, Math.min(thermalY, thermalH - 1));
-
-            // Read temperature from snapshot array
-            float temp = snap.tempC[thermalY * thermalW + thermalX];
-
-            return Float.isFinite(temp) ? (double) temp : null;
-
-        } catch (Exception e) {
-            Log.e(TAG, "Error getting temperature at point", e);
-            return null;
-        }
+        return result[0];
     }
 
     /**
@@ -286,65 +286,108 @@ class CameraHandler {
 
         connectedStream.start(
                 unused -> {
-                    // FRAME SKIPPING: Only process if enough time has passed
                     long currentTime = System.currentTimeMillis();
-                    long lastTime = lastFrameTime.get();
 
-                    if (currentTime - lastTime < MIN_FRAME_INTERVAL_MS) {
-                        return; // Skip this frame
+                    // Skip frames based on time interval only
+                    if (currentTime - lastFrameTime.get() < MIN_FRAME_INTERVAL_MS) {
+                        return;
                     }
 
-                    // Check if previous frame is still processing
-                    if (isProcessing.get()) {
-                        return; // Skip if still busy
-                    }
-
-                    isProcessing.set(true);
                     lastFrameTime.set(currentTime);
                     frameCounter++;
 
+                    // UPDATE: This is needed to refresh the streamer's image buffer
                     streamer.update();
 
-                    // Process frame on background thread
-                    processingHandler.post(() -> processFrame());
+                    // Process directly in callback thread (faster, no queue buildup)
+                    try {
+                        // Apply palette once
+                        if (frameCounter == 1) {
+                            streamer.withThermalImage(img -> applyColorPalette(img));
+                        }
+
+                        // Get bitmap directly
+                        Bitmap bmp = BitmapAndroid.createBitmap(streamer.getImage()).getBitMap();
+
+                        // Send to UI immediately
+                        if (streamDataListener != null && bmp != null) {
+                            streamDataListener.images(bmp, null);
+                        }
+
+                    } catch (Exception e) {
+                        Log.e(TAG, "Frame error", e);
+                    }
                 },
-                error -> {
-                    Log.e(TAG, "Stream error: " + error);
-                    isProcessing.set(false);
-                }
+                error -> Log.e(TAG, "Stream error: " + error)
         );
     }
 
     /**
      * OPTIMIZED frame processing - runs on background thread
      */
+    /**
+     * OPTIMIZED frame processing - runs on background thread
+     */
+
+    // Store minimal data for on-demand snapshot
+    private volatile int lastW = 0, lastH = 0;
+
+    private void storeImageReference(ThermalImage thermalImage) {
+        try {
+            int w = thermalImage.getWidth();
+            int h = thermalImage.getHeight();
+
+            if (w <= 0 || h <= 0 || w == -1 || h == -1) return;
+
+            lastW = w;
+            lastH = h;
+
+            // Only sample 4 corner points for min/max (super fast)
+            double minC = Double.POSITIVE_INFINITY;
+            double maxC = Double.NEGATIVE_INFINITY;
+
+            Point[] samples = {
+                    new Point(0, 0),
+                    new Point(w-1, 0),
+                    new Point(0, h-1),
+                    new Point(w-1, h-1),
+                    new Point(w/2, h/2)
+            };
+
+            for (Point p : samples) {
+                ThermalValue tv = thermalImage.getValueAt(p);
+                if (tv != null && Double.isFinite(tv.value)) {
+                    if (tv.value < minC) minC = tv.value;
+                    if (tv.value > maxC) maxC = tv.value;
+                }
+            }
+
+            lastMinTempC = minC;
+            lastMaxTempC = maxC;
+
+        } catch (Exception e) {
+            // Ignore
+        }
+    }
     private void processFrame() {
         try {
             final Bitmap[] bitmaps = new Bitmap[2]; // [0]=thermal, [1]=visible
+            final Bitmap[] oldBitmaps = new Bitmap[2]; // Track old bitmaps for recycling
 
             streamer.withThermalImage(thermalImage -> {
                 try {
-                    // Apply color palette for visualization (Iron palette = orange/purple)
-                    applyColorPalette(thermalImage);
-
-                    // Extract thermal bitmap (now with color!)
-                    bitmaps[0] = BitmapAndroid.createBitmap(streamer.getImage()).getBitMap();
-
-                    // Extract visible photo for MSX
-                    try {
-                        bitmaps[1] = BitmapAndroid.createBitmap(
-                                Objects.requireNonNull(
-                                        Objects.requireNonNull(thermalImage.getFusion()).getPhoto()
-                                )
-                        ).getBitMap();
-                    } catch (Exception e) {
-                        Log.w(TAG, "No visible photo available");
-                        bitmaps[1] = null;
+                    // Apply palette ONCE at startup only
+                    if (frameCounter == 1) {
+                        applyColorPalette(thermalImage);
                     }
 
-                    // CRITICAL: Build snapshot of thermal data (for measurements & capture)
-                    // Always update snapshot to ensure it's available for capture
-                    buildAndStoreSnapshot(thermalImage);
+                    // Extract thermal bitmap only (skip visible photo for speed)
+                    bitmaps[0] = BitmapAndroid.createBitmap(streamer.getImage()).getBitMap();
+
+                    // Build snapshot only every 10 frames (not 3)
+                    if (frameCounter % 10 == 0) {
+                        buildAndStoreSnapshot(thermalImage);
+                    }
 
                 } catch (Exception e) {
                     Log.e(TAG, "Error processing thermal image", e);
@@ -412,7 +455,7 @@ class CameraHandler {
      */
     private void applyColorPalette(ThermalImage thermalImage) {
         try {
-            // Set temperature unit to Celsius
+            // CRITICAL: Set temperature unit to Celsius
             thermalImage.setTemperatureUnit(TemperatureUnit.CELSIUS);
 
             // Get default palettes and apply Iron (first palette)
@@ -420,8 +463,8 @@ class CameraHandler {
                     PaletteManager.getDefaultPalettes();
 
             if (palettes != null && !palettes.isEmpty()) {
-                // Index 0 is typically Iron/Ironbow palette (orange/purple)
                 thermalImage.setPalette(palettes.get(0));
+                Log.d(TAG, "Applied palette: " + palettes.get(0).name);
             }
 
         } catch (Exception e) {
@@ -430,44 +473,88 @@ class CameraHandler {
     }
 
     /**
-     * Change the color palette - call this from MainActivity to switch palettes
-     */
-    public void setColorPalette(String paletteName) {
-        // Palette changes will apply on next frame
-        Log.d(TAG, "Palette change requested: " + paletteName + " (will apply on next frame)");
-    }
-
-    /**
-     * Get list of available palette names from the SDK
-     */
-    public String[] getAvailablePalettes() {
-        try {
-            java.util.List<com.flir.thermalsdk.image.Palette> palettes =
-                    PaletteManager.getDefaultPalettes();
-
-            if (palettes != null && !palettes.isEmpty()) {
-                String[] names = new String[palettes.size()];
-                for (int i = 0; i < palettes.size(); i++) {
-                    names[i] = palettes.get(i).name;
-                }
-                return names;
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to get palettes", e);
-        }
-        return new String[]{"Default"};
-    }
-
-    /**
      * Build full temperature snapshot (for capture/save operations)
      */
     public TempFrameSnapshot buildTempSnapshotSync() throws Exception {
-        TempFrameSnapshot snap = lastSnapshot;
-        if (snap == null) {
-            throw new IllegalStateException("No thermal snapshot available - wait a moment after connecting");
+        // Build fresh snapshot synchronously when capture is pressed
+        final TempFrameSnapshot[] result = new TempFrameSnapshot[1];
+        final Exception[] error = new Exception[1];
+
+        // Use streamer to get current frame with FULL thermal data
+        if (streamer != null) {
+            streamer.withThermalImage(thermalImage -> {
+                try {
+                    int w = thermalImage.getWidth();
+                    int h = thermalImage.getHeight();
+
+                    if (w <= 0 || h <= 0 || w == -1 || h == -1) {
+                        error[0] = new IllegalStateException("Invalid dimensions: " + w + "x" + h);
+                        return;
+                    }
+
+                    float[] tempC = new float[w * h];
+                    double minC = Double.POSITIVE_INFINITY;
+                    double maxC = Double.NEGATIVE_INFINITY;
+
+                    // Extract ALL temperature data pixel by pixel
+                    for (int y = 0; y < h; y++) {
+                        int offset = y * w;
+                        for (int x = 0; x < w; x++) {
+                            ThermalValue tv = thermalImage.getValueAt(new Point(x, y));
+                            float val = (tv != null) ? (float) tv.value : Float.NaN;
+                            tempC[offset + x] = val;
+
+                            if (Float.isFinite(val)) {
+                                if (val < minC) minC = val;
+                                if (val > maxC) maxC = val;
+                            }
+                        }
+                    }
+
+                    result[0] = new TempFrameSnapshot(tempC, w, h, minC, maxC);
+                    Log.d(TAG, "Built snapshot: " + w + "x" + h + ", Min: " + minC + "°C, Max: " + maxC + "°C");
+
+                } catch (Exception e) {
+                    error[0] = e;
+                }
+            });
         }
-        Log.d(TAG, "Returning snapshot: " + snap.w + "x" + snap.h + ", Min: " + snap.minC + "°C, Max: " + snap.maxC + "°C");
-        return snap;
+
+        if (error[0] != null) throw error[0];
+        if (result[0] == null) {
+            throw new IllegalStateException("Failed to build snapshot - camera not streaming");
+        }
+
+        return result[0];
+    }
+
+    private TempFrameSnapshot buildSnapshotFromImage(ThermalImage thermalImage) {
+        int w = thermalImage.getWidth();
+        int h = thermalImage.getHeight();
+
+        if (w <= 0 || h <= 0 || w == -1 || h == -1) {
+            return null;
+        }
+
+        float[] tempC = new float[w * h];
+        double minC = Double.POSITIVE_INFINITY;
+        double maxC = Double.NEGATIVE_INFINITY;
+
+        for (int y = 0; y < h; y++) {
+            int offset = y * w;
+            for (int x = 0; x < w; x++) {
+                ThermalValue tv = thermalImage.getValueAt(new Point(x, y));
+                float val = (tv != null) ? (float) tv.value : Float.NaN;
+                tempC[offset + x] = val;
+
+                if (Float.isFinite(val)) {
+                    if (val < minC) minC = val;
+                    if (val > maxC) maxC = val;
+                }
+            }
+        }
+
+        return new TempFrameSnapshot(tempC, w, h, minC, maxC);
     }
 
     public void add(Identity identity) {
