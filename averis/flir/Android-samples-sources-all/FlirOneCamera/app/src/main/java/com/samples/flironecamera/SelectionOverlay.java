@@ -126,7 +126,7 @@ public class SelectionOverlay extends View {
         // Border (white)
         borderPaint.setStyle(Paint.Style.STROKE);
         borderPaint.setStrokeWidth(BORDER_WIDTH);
-        borderPaint.setColor(0xFFFFFFFF);
+        borderPaint.setColor(0xFF00CC00);
 
         // Shade (semi-transparent)
         shadePaint.setColor(0x33FFFFFF);
@@ -134,12 +134,12 @@ public class SelectionOverlay extends View {
 
         // Handle circles
         handlePaint.setStyle(Paint.Style.FILL);
-        handlePaint.setColor(0xFFFFFFFF);
+        handlePaint.setColor(0xFF00CC00);
         handlePaint.setShadowLayer(4f, 0f, 2f, 0x80000000);
 
         // Text (white with shadow)
         float scaled = TEXT_SIZE_SP * getResources().getDisplayMetrics().scaledDensity;
-        textPaint.setColor(0xFFFFFFFF);
+        textPaint.setColor(0xFF00CC00);
         textPaint.setTextSize(scaled);
         textPaint.setTextAlign(Paint.Align.CENTER);
         textPaint.setShadowLayer(3f, 0f, 1f, 0xFF000000);
@@ -147,7 +147,7 @@ public class SelectionOverlay extends View {
         // Crosshair (dashed)
         crosshairPaint.setStyle(Paint.Style.STROKE);
         crosshairPaint.setStrokeWidth(1.5f);
-        crosshairPaint.setColor(0xAAFFFFFF);
+        crosshairPaint.setColor(0xFF00CC00);
         crosshairPaint.setPathEffect(new DashPathEffect(new float[]{10f, 10f}, 0));
     }
 

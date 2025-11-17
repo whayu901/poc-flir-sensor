@@ -33,12 +33,12 @@ public class MultiPointOverlay extends View {
 
     private void initPaints(Context ctx) {
         crosshairPaint.setStrokeWidth(STROKE);
-        crosshairPaint.setColor(0xFFFFFFFF);
+        crosshairPaint.setColor(0xFF00CC00);
         crosshairPaint.setStyle(Paint.Style.STROKE);
         crosshairPaint.setShadowLayer(3f, 0f, 1f, 0xFF000000);
 
         float scaled = TEXT_SIZE_SP * ctx.getResources().getDisplayMetrics().scaledDensity;
-        textPaint.setColor(0xFFFFFFFF);
+        textPaint.setColor(0xFF00CC00);
         textPaint.setTextSize(scaled);
         textPaint.setTextAlign(Paint.Align.CENTER);
         textPaint.setShadowLayer(3f, 0f, 1f, 0xFF000000);

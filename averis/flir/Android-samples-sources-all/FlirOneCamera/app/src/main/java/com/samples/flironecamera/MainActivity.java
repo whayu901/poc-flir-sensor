@@ -560,11 +560,14 @@ public class MainActivity extends AppCompatActivity {
                 .setCancelable(true)
                 .create();
 
+// Make dialog FULLSCREEN
         if (dialog.getWindow() != null) {
             dialog.getWindow().setLayout(
-                    (int)(getResources().getDisplayMetrics().widthPixels * 0.95), // 95% screen width
-                    (int)(getResources().getDisplayMetrics().heightPixels * 0.85)  // 85% screen height
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT
             );
+            // Remove padding/margins
+            dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
         }
 
         closeBtn.setOnClickListener(v -> dialog.dismiss());

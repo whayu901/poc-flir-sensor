@@ -2,9 +2,9 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/dialogRoot"
     android:orientation="vertical"
-    android:padding="16dp"
     android:layout_width="match_parent"
-    android:layout_height="wrap_content">
+    android:layout_height="match_parent"
+    android:background="#000000">
 
     <!-- Mode selector row -->
     <LinearLayout
@@ -13,7 +13,8 @@
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:paddingBottom="8dp">
+        android:padding="8dp"
+        android:background="#222222">
 
         <TextView
             android:id="@+id/modeLabel"
@@ -21,6 +22,7 @@
             android:layout_height="wrap_content"
             android:text="Mode"
             android:textStyle="bold"
+            android:textColor="#FFFFFF"
             android:layout_marginEnd="12dp"/>
 
         <Spinner
@@ -30,14 +32,15 @@
             android:layout_weight="1"/>
     </LinearLayout>
 
-    <!-- Count row (visible only in "Pointing (multiple)") -->
+    <!-- Count row -->
     <LinearLayout
         android:id="@+id/countRow"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:paddingBottom="8dp"
+        android:padding="8dp"
+        android:background="#222222"
         android:visibility="gone">
 
         <TextView
@@ -46,6 +49,7 @@
             android:layout_height="wrap_content"
             android:text="Spots"
             android:textStyle="bold"
+            android:textColor="#FFFFFF"
             android:layout_marginEnd="12dp"/>
 
         <Spinner
@@ -55,20 +59,19 @@
             android:layout_weight="1"/>
     </LinearLayout>
 
-    <!-- Image preview container (overlay is added on top of this) -->
+    <!-- Image preview container - FILLS REMAINING SPACE -->
     <FrameLayout
         android:id="@+id/previewContainer"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:minHeight="300dp"
         android:background="#000000">
 
         <ImageView
             android:id="@+id/capturedImageView"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:scaleType="fitCenter" />
+            android:scaleType="fitCenter"/>
     </FrameLayout>
 
     <!-- Temperature stats -->
@@ -76,22 +79,21 @@
         android:id="@+id/tempStatsText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:paddingTop="10dp"
-        android:paddingBottom="10dp"
+        android:padding="12dp"
         android:text="High: --°C   Low: --°C"
         android:textSize="16sp"
         android:textColor="#FFFFFF"
         android:background="#333333"
-        android:paddingStart="8dp"
-        android:paddingEnd="8dp"/>
+        android:gravity="center"/>
 
-    <!-- Buttons row at the bottom -->
+    <!-- Buttons row -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:gravity="center"
-        android:paddingTop="8dp">
+        android:padding="12dp"
+        android:background="#222222">
 
         <Button
             android:id="@+id/saveDialogBtn"
